@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+cache/
+data/
+tmp/
+temp/
+runtime/
+*.download
+bilibili_cookies.txt
+
