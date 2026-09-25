@@ -20,6 +20,19 @@ from .types import MediaCacheEntry, MediaStatus, MediaType
     "提取指定音视频内容；语音同步返回，视频通过后台通知返回。",
 )
 async def analyze_media_file(_ctx: AgentCtx, media_id: str, message: str = "") -> str:
+    """分析缓存中的音频或视频媒体。
+
+    Args:
+        media_id (str): 媒体消息创建的句柄 ID，格式为媒体通知中提供的句柄。
+        message (str, optional): 用户希望重点关注的内容或问题。默认为空，表示进行常规分析。
+
+    Returns:
+        str: 音频会同步返回分析结果；视频会返回已提交后台任务的状态，任务完成后向原聊天推送结果。
+
+    Raises:
+        ValueError: 媒体句柄不存在时抛出。
+        Exception: 音频分析失败时保留原始异常并抛出；视频分析失败会通过后台通知报告。
+    """
     clean_id = str(media_id).strip(" '\"\n\t")
     entry = MEDIA_CACHE.get_entry(clean_id)
     if entry is None:
