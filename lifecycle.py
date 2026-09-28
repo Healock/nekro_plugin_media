@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 
-from nonebot.matcher import matchers
-
 from . import MEDIA_CACHE, background_tasks, generated_temp_files, plugin
 from .bilibili.registration import cleanup as cleanup_bilibili
 from .matcher import media_interceptor
+from .matcher_cleanup import destroy_matcher
 
 
 @plugin.mount_cleanup_method()
@@ -26,9 +25,4 @@ async def cleanup() -> None:
             continue
     generated_temp_files.clear()
     MEDIA_CACHE.clear()
-    for priority, registered in list(matchers.items()):
-        remaining = [matcher for matcher in registered if matcher is not media_interceptor]
-        if remaining:
-            matchers[priority] = remaining
-        else:
-            matchers.pop(priority, None)
+    destroy_matcher(media_interceptor)
