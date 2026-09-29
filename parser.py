@@ -9,6 +9,7 @@ from nekro_agent.api import core
 
 from .gemini import GeminiClient
 from .media_io import MediaIO
+from .model_config import resolve_model_config
 from .prompts import build_media_prompt
 from .types import MediaCacheEntry, MediaStatus, MediaType
 
@@ -16,13 +17,12 @@ from .types import MediaCacheEntry, MediaStatus, MediaType
 class MediaParser:
     def __init__(
         self,
-        api_key: str,
-        model: str,
+        model_config: Any,
         temp_dir: Path,
         generated_files: set[Path],
     ) -> None:
         self.io = MediaIO(temp_dir, generated_files)
-        self.gemini = GeminiClient(api_key, model)
+        self.gemini = GeminiClient(resolve_model_config(model_config))
 
     async def resolve_source(
         self,
