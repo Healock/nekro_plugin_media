@@ -2,6 +2,8 @@
 
 > 处理 OneBot 音频和视频消息，并整合 Bilibili 分享链接解析、下载与媒体分析能力。
 
+媒体分析使用 NekroAgent 的模型组配置。旧版 Gemini 配置仅用于兼容原有部署。
+
 ## 快速开始
 
 将整个 `nekro_plugin_media` 目录复制到 NekroAgent 数据目录的插件工作区：
@@ -21,7 +23,8 @@ nekro_plugin_media/
 ├── matcher.py        # 音视频消息拦截器
 ├── parser.py         # 媒体解析流程
 ├── media_io.py       # 文件读取和 ffmpeg 转换
-├── gemini.py         # Gemini API 客户端
+├── gemini.py         # 模型组媒体调用客户端
+├── model_config.py   # Nekro 模型组解析与旧配置兼容
 ├── prompts.py        # 媒体分析提示词
 ├── cache.py          # 媒体句柄缓存
 ├── sandbox.py        # analyze_media_file 沙盒方法
@@ -43,8 +46,9 @@ nekro_plugin_media/
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | 空 | Gemini API Key，使用媒体分析时必须配置 |
-| `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini 模型名称 |
+| `MEDIA_MODEL_GROUP` | 空 | Nekro 中用于媒体分析的聊天模型组；新部署建议选择 `default` 或其他聊天模型组 |
+| `GEMINI_API_KEY` | 空 | 旧版兼容配置；设置模型组后不再使用 |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | 旧版兼容配置；设置模型组后不再使用 |
 | `download_quality` | `480p` | Bilibili 下载画质 |
 | `max_duration` | `30` | Bilibili 视频最大时长，单位为分钟 |
 | `desc_char_limit` | `150` | Bilibili 简介截断长度 |
@@ -55,7 +59,8 @@ nekro_plugin_media/
 ## 外部依赖
 
 - NekroAgent 和 OneBot V11 适配器。
-- Gemini API Key，以及可访问 Gemini API 的网络环境。
+- Nekro 模型组及其对应服务商的网络环境。模型组的 API Key、请求地址和模型名称由 Nekro 统一管理。
+- 使用非 Gemini 原生模型组时，服务商必须支持 OpenAI 兼容的音频或视频多模态输入；具体能力由服务商决定。
 - `ffmpeg`，用于部分音视频转换。
 - `yt-dlp`，用于 Bilibili 视频下载；部署时需要确保插件运行环境可以安装或提供该依赖。
 - 可选的 `bilibili_cookies.txt`，放在插件数据目录中，用于需要登录态的下载场景。
@@ -78,7 +83,9 @@ nekro_plugin_media/
 python -m py_compile *.py bilibili\*.py
 ```
 
-完整行为需要真实的 NekroAgent、OneBot V11、Gemini、ffmpeg、yt-dlp 和 NapCat 环境验证。
+插件会优先使用 `MEDIA_MODEL_GROUP`。旧版 `GEMINI_API_KEY` 和 `GEMINI_MODEL` 仅在未设置模型组时作为回退，不建议新部署继续填写。
+
+完整行为需要真实的 NekroAgent、OneBot V11、模型服务商、ffmpeg、yt-dlp 和 NapCat 环境验证。模型组配置变更后，应确认服务商支持当前媒体类型；本插件未在本地完成真实音视频请求验证。
 
 ## 相关资源
 

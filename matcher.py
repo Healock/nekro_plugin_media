@@ -11,6 +11,7 @@ from nekro_agent.api import core
 
 from . import MEDIA_CACHE, MediaConfig, plugin
 from .locator import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, extract_media_info
+from .model_config import has_model_config
 from .types import MediaCacheEntry, MediaStatus
 
 
@@ -20,7 +21,7 @@ media_interceptor = on_message(priority=10, block=False)
 @media_interceptor.handle()
 async def handle_media_message(bot: Bot, event: MessageEvent) -> None:
     config = plugin.get_config(MediaConfig)
-    if not config.GEMINI_API_KEY:
+    if not has_model_config(config):
         return
     _normalize_file_segments(event.message)
     target = next((segment for segment in event.message if segment.type in {"video", "record", "file"}), None)

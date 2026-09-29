@@ -42,7 +42,7 @@ async def analyze_media_file(_ctx: AgentCtx, media_id: str, message: str = "") -
     if entry.status is MediaStatus.PROCESSING:
         return "【处理中】目标资源正在处理，请等待后续通知。"
     config = plugin.get_config(MediaConfig)
-    parser = MediaParser(config.GEMINI_API_KEY, config.GEMINI_MODEL, _temp_dir(), generated_temp_files)
+    parser = MediaParser(config, _temp_dir(), generated_temp_files)
     if entry.type is MediaType.AUDIO:
         entry.status = MediaStatus.PROCESSING
         try:
