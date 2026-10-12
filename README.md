@@ -1,6 +1,6 @@
 # NekroAgent 媒体阅读器
 
-> 处理 OneBot 音频和视频消息，并整合 Bilibili 分享链接解析、下载与媒体分析能力。
+> 处理 OneBot 音频和视频消息，并整合 Bilibili / 抖音分享链接解析、下载与媒体分析能力。
 
 媒体分析使用 NekroAgent 的模型组配置。旧版 Gemini 配置仅用于兼容原有部署。
 
@@ -31,16 +31,27 @@ nekro_plugin_media/
 ├── commands.py       # 管理命令
 ├── lifecycle.py      # 生命周期清理
 ├── types.py          # 媒体类型和处理状态
-└── bilibili/         # Bilibili 子模块，不是独立 Nekro 插件
+├── bilibili/         # Bilibili 子模块，不是独立 Nekro 插件
+└── douyin/           # 抖音子模块，不是独立 Nekro 插件
 ```
 
 ## 功能说明
 
 - Bilibili 链路使用优先级 `9`，识别分享链接并替换为视频消息，同时注入标题、来源、简介和热评。
+- 抖音链路使用优先级 `9`，识别分享链接：视频帖替换为无水印视频消息，图文帖直接展开图片并注入文案、作者与互动数据。
 - 媒体分析链路使用优先级 `10`，为音频和视频建立句柄，按需调用 `analyze_media_file`。
 - 音频解析同步返回结果；视频解析进入后台任务，完成后向原聊天推送结果。
-- 缓存、临时文件和 Bilibili 下载任务可通过 `clear_media` 命令清理。
-- Bilibili 已并入本插件，`bilibili/` 不包含第二个 `NekroPlugin` 实例。
+- 缓存、临时文件以及 Bilibili / 抖音下载任务可通过 `clear_media` 命令清理。
+- Bilibili 与抖音均已并入本插件，`bilibili/`、`douyin/` 不包含第二个 `NekroPlugin` 实例。
+
+## 抖音解析说明
+
+- 主链路零签名、零登录 Cookie，不依赖第三方解析接口，也不依赖 Node/JS 签名：
+  短链经一次 302 跳转得到 `aweme_id`，再请求 `iesdouyin.com` 分享页，从内联的 `_ROUTER_DATA`
+  提取作品信息，并将播放地址中的 `playwm` 替换为 `play` 得到无水印直链。
+- 实测分享页在完全无 Cookie 时会返回空壳页面；此时插件会向 `ttwid.bytedance.com` 匿名注册一枚设备
+  Cookie `ttwid` 后重试（仍不含登录态与签名）。
+- 直链下载失败时，回退到 `yt-dlp`（复用与 Bilibili 相同的动态依赖）。
 
 ## 配置
 
@@ -54,6 +65,9 @@ nekro_plugin_media/
 | `desc_char_limit` | `150` | Bilibili 简介截断长度 |
 | `comment_count` | `3` | 注入的 Bilibili 热评数量 |
 | `comment_char_limit` | `100` | 单条热评截断长度 |
+| `douyin_download_quality` | `720p` | 抖音 yt-dlp 兜底下载画质 |
+| `douyin_max_duration` | `30` | 抖音视频最大时长，单位为分钟 |
+| `douyin_desc_char_limit` | `150` | 抖音文案截断长度 |
 | `NAPCAT_TEMP_DIR` | `/app/.config/QQ/NapCat/temp` | NapCat 临时文件目录 |
 
 ## 外部依赖
@@ -62,8 +76,9 @@ nekro_plugin_media/
 - Nekro 模型组及其对应服务商的网络环境。模型组的 API Key、请求地址和模型名称由 Nekro 统一管理。
 - 使用非 Gemini 原生模型组时，服务商必须支持 OpenAI 兼容的音频或视频多模态输入；具体能力由服务商决定。
 - `ffmpeg`，用于部分音视频转换。
-- `yt-dlp`，用于 Bilibili 视频下载；部署时需要确保插件运行环境可以安装或提供该依赖。
+- `yt-dlp`，用于 Bilibili 视频下载，以及抖音直链失败时的兜底下载；部署时需要确保插件运行环境可以安装或提供该依赖。
 - 可选的 `bilibili_cookies.txt`，放在插件数据目录中，用于需要登录态的下载场景。
+- 可选的 `douyin_cookies.txt`，放在插件数据目录中，用于抖音 yt-dlp 兜底下载需要登录态的场景。
 
 ## 沙盒方法与命令
 
@@ -73,19 +88,27 @@ nekro_plugin_media/
 
 ### `clear_media`
 
-超级用户命令，清理媒体和 Bilibili 临时文件，并取消未完成的下载任务。
+超级用户命令，清理媒体、Bilibili 与抖音临时文件，并取消未完成的下载任务。
 
 ## 开发
 
-插件入口在 `__init__.py` 中定义并导出 `plugin` 实例，Bilibili 注册模块在包加载时由入口加载。修改后可执行：
+插件入口在 `__init__.py` 中定义并导出 `plugin` 实例，Bilibili 与抖音注册模块在包加载时由入口加载。修改后可执行：
 
 ```powershell
-python -m py_compile *.py bilibili\*.py
+python -m py_compile *.py bilibili\*.py douyin\*.py
+```
+
+抖音分享页解析等纯逻辑可用 pytest 验证（`tests/` 目录），无需真实网络：
+
+```powershell
+python -m pytest tests
 ```
 
 插件会优先使用 `MEDIA_MODEL_GROUP`。旧版 `GEMINI_API_KEY` 和 `GEMINI_MODEL` 仅在未设置模型组时作为回退，不建议新部署继续填写。
 
-完整行为需要真实的 NekroAgent、OneBot V11、模型服务商、ffmpeg、yt-dlp 和 NapCat 环境验证。模型组配置变更后，应确认服务商支持当前媒体类型；本插件未在本地完成真实音视频请求验证。
+完整行为需要真实的 NekroAgent、OneBot V11、模型服务商、ffmpeg、yt-dlp 和 NapCat 环境验证。模型组配置变更后，应确认服务商支持当前媒体类型；媒体分析链路本身未在本地完成真实音视频请求验证。
+
+抖音主链路（短链解析、分享页 `_ROUTER_DATA`、`playwm → play` 去水印、直链下载）已在真实网络下验证；`yt-dlp` 兜底与 OneBot 端到端投递仍需完整运行环境确认。
 
 ## 相关资源
 
