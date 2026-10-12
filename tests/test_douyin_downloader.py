@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import logging
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -193,7 +194,9 @@ def test_ytdlp_success_publishes_staged_output_and_removes_staging_dir(
 ) -> None:
     received: list[str] = []
 
-    def fake_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+    def fake_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
         received.append(out_tmpl)
         _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
 
@@ -216,7 +219,9 @@ def test_ytdlp_success_publishes_staged_output_and_removes_staging_dir(
 def test_ytdlp_failure_leaves_no_output_and_cleans_staging(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    def failing_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+    def failing_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
         # 失败前已写入带 ftyp 头的半成品，正好覆盖“截断文件被误判缓存”的场景。
         _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
         raise RuntimeError("yt-dlp boom")
@@ -238,7 +243,9 @@ def test_ytdlp_failure_leaves_no_output_and_cleans_staging(
 def test_ytdlp_verify_failure_discards_staged_without_publishing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    def fake_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+    def fake_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
         _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
 
     def reject(_path: Path) -> None:
@@ -256,3 +263,58 @@ def test_ytdlp_verify_failure_discards_staged_without_publishing(
 
     asyncio.run(scenario())
     assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_cancel_while_worker_running_defers_cleanup_to_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """下载线程尚未退出时取消任务：cleanup 由 worker 自己收尾，不与取消方并发。
+
+    线程无法被强制终止，因此取消只发协作信号。断言：
+    - 取消方在 worker 仍运行时**不得**删除暂存目录（避免并发清理）；
+    - worker 收到取消信号后丢弃产物、由自己删除暂存目录，最终无残留、未发布成品。
+    """
+    started = threading.Event()
+    release = threading.Event()
+    observed: dict[str, bool] = {}
+
+    def blocking_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, cancel_event: threading.Event
+    ) -> None:
+        # 模拟“线程尚未退出”：先在暂存目录落个半成品再阻塞，等测试放行。
+        Path(out_tmpl).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_tmpl).parent.joinpath(f"{aweme_id}.mp4").write_bytes(_FTYP_HEADER)
+        started.set()
+        release.wait(timeout=5.0)
+        observed["cancel_set"] = cancel_event.is_set()
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", blocking_ytdlp)
+
+    async def scenario() -> None:
+        out = tmp_path / "8.mp4"
+        task = asyncio.create_task(
+            downloader._download_guarded("8", out, None, None, "720p", tmp_path, 30.0)
+        )
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "worker 线程应已进入阻塞"
+        assert list(tmp_path.glob(".ytdlp-*")), "worker 运行期间暂存目录应存在"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # 取消后 worker 仍在运行：取消方不得抢先删除它仍在使用的暂存目录。
+        assert list(tmp_path.glob(".ytdlp-*")), "取消方不得与 worker 并发清理暂存目录"
+
+        release.set()  # 放行 worker，交由它自行收尾
+        for _ in range(500):
+            if not list(tmp_path.glob(".ytdlp-*")):
+                break
+            await asyncio.sleep(0.01)
+        assert list(tmp_path.glob(".ytdlp-*")) == [], "worker 结束后应无残留暂存目录"
+        assert not out.exists(), "取消后不得发布成品"
+        assert observed.get("cancel_set") is True, "worker 应观察到协作式取消信号"
+
+    asyncio.run(scenario())

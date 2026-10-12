@@ -22,6 +22,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegme
 from ..download_kit import MediaDownloadError, run_with_retry
 from .api import DOUYIN_URL_REGEX, fetch_douyin_context, resolve_aweme_id
 from .downloader import auto_clean_temp_dir, find_cached_file, schedule_download
+from .notify import notify_user, watch_download
 
 __all__ = [
     "douyin_interceptor",
@@ -92,35 +93,6 @@ async def _resolve_context(target_url: str) -> tuple[str, Any]:
     )
 
 
-async def _notify_user(bot: Bot | None, event: MessageEvent, text: str) -> None:
-    """向来源聊天发送一条用户可见的提示；发送本身失败只记日志，不再抛出。"""
-    if bot is None:
-        return
-    try:
-        await bot.send(event, text)
-    except Exception as exc:  # noqa: BLE001 - 通知失败不应影响主流程
-        core.logger.warning(f"[Douyin] 失败提示发送失败：{exc}")
-
-
-def _watch_download(task: asyncio.Task[None], aweme_id: str, bot: Bot | None, event: MessageEvent) -> None:
-    """监听后台下载任务，失败时向发送者推送可读原因。"""
-    if bot is None:
-        return
-
-    def _done(finished: asyncio.Task[None]) -> None:
-        if finished.cancelled():
-            return
-        exc = finished.exception()
-        if exc is None:
-            return
-        reason = exc.user_message() if isinstance(exc, MediaDownloadError) else "下载失败，请稍后重试"
-        asyncio.create_task(
-            _notify_user(bot, event, f"【抖音下载失败】{aweme_id}\n{reason}\n可稍后重新发送该链接重试。")
-        )
-
-    task.add_done_callback(_done)
-
-
 async def process_message(
     event: MessageEvent, config: object, data_dir: Path, bot: Bot | None = None
 ) -> None:
@@ -132,17 +104,17 @@ async def process_message(
         aweme_id, context = await _resolve_context(target_url)
     except MediaDownloadError as exc:
         core.logger.warning(f"[Douyin] 解析失败（{exc.kind.value}）：{exc.detail}")
-        await _notify_user(bot, event, f"【抖音解析失败】{exc.user_message()}")
+        await notify_user(bot, event, f"【抖音解析失败】{exc.user_message()}")
         return
     except Exception as exc:  # noqa: BLE001 - 兜底防漏，仍要告知用户
         core.logger.error(f"[Douyin] 解析异常：{exc}")
-        await _notify_user(bot, event, "【抖音解析失败】解析过程中发生未知错误，请稍后重试。")
+        await notify_user(bot, event, "【抖音解析失败】解析过程中发生未知错误，请稍后重试。")
         return
 
     max_minutes = _config_int(config, "douyin_max_duration", 30)
     if not context.is_gallery and max_minutes > 0 and context.duration > max_minutes * 60:
         core.logger.warning(f"[Douyin] 视频超过时长限制：{aweme_id}")
-        await _notify_user(bot, event, f"【抖音视频超时长】该视频超过 {max_minutes} 分钟限制，已跳过处理。")
+        await notify_user(bot, event, f"【抖音视频超时长】该视频超过 {max_minutes} 分钟限制，已跳过处理。")
         return
 
     temp_dir = data_dir / "douyin"
@@ -150,7 +122,7 @@ async def process_message(
         temp_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         core.logger.error(f"[Douyin] 临时目录不可用：{exc}")
-        await _notify_user(bot, event, "【抖音解析失败】本地临时目录不可写，请检查磁盘空间或权限。")
+        await notify_user(bot, event, "【抖音解析失败】本地临时目录不可写，请检查磁盘空间或权限。")
         return
     await asyncio.to_thread(auto_clean_temp_dir, temp_dir)
 
@@ -178,7 +150,7 @@ async def process_message(
                         watermark_url=context.video_url_watermarked,
                         timeout=float(_config_int(config, "douyin_download_timeout", 180)),
                     )
-                    _watch_download(task, aweme_id, bot, event)
+                    watch_download(task, aweme_id, bot, event)
                 replacement.append(MessageSegment.video(file=str(media_path.absolute())))
         else:
             replacement.append(segment)

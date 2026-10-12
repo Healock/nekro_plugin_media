@@ -5,6 +5,14 @@
 ``.part``，yt-dlp 档位写唯一临时目录 ``.ytdlp-<id>-<uuid>/``。因此成品文件永远只会是
 被校验过的完整文件；任何异常、取消或超时都会清理临时文件/目录，绝不残留可能被误判为
 缓存的半成品，也避免迟到线程覆盖后续同一作品的新下载结果。
+
+yt-dlp 档位的整个生命周期（建暂存目录 → 下载 → 校验 → 原子发布 → 清理）收拢在**同一个
+工作线程**内顺序完成（见 :func:`_download_ytdlp_staged`）。因为线程本身不可被强制终止，
+超时/取消只通过 ``threading.Event`` 协作式发信号（yt-dlp 进度钩子据此尽快中止下载），由
+worker 自行收尾：只有 worker 结束后才删除暂存目录，取消方不再并发清理，因而不存在“清理与
+worker 并发”或“目录被删后 worker 重新落盘”。取消发生在发布前时丢弃暂存产物，保持“取消即
+无副作用”；残留的中间目录由 :func:`auto_clean_temp_dir` 兜底清理。
+
 同一 ``aweme_id`` 的并发请求复用同一后台任务，避免重复下载与文件竞态。
 """
 
@@ -12,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import threading
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -141,14 +150,28 @@ async def _download_direct(video_url: str, output_path: Path, referer: str) -> N
             raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(output_path))
 
 
-def _download_with_ytdlp(aweme_id: str, out_tmpl: str, format_str: str, data_dir: Path) -> None:
+class _CancelledDownload(Exception):
+    """协作式取消 yt-dlp 下载的内部信号：由进度钩子抛出以尽快中止下载。"""
+
+
+def _download_with_ytdlp(
+    aweme_id: str, out_tmpl: str, format_str: str, data_dir: Path, cancel_event: threading.Event
+) -> None:
     """yt-dlp 兜底下载（在线程中执行）。
 
     写入调用方给定的**唯一临时输出模板**；失败会抛异常，不再以 ``ignoreerrors`` 静默。
     真正的成品由调用方在“线程退出且校验通过”后原子发布，因此本函数绝不会直接写
     ``output_path``——即使线程被超时/取消后迟到，也只会在自己的临时目录内产生文件。
+
+    ``cancel_event`` 为协作式取消信号：注册进度钩子，在被置位时抛 :class:`_CancelledDownload`
+    尽快中止下载（线程无法被强制终止，这是“不引子进程”约束下可用的最快收敛手段）。
     """
     yt_dlp = dynamic_import_pkg("yt-dlp>=2025.1.15", import_name="yt_dlp")
+
+    def _abort_if_cancelled(_status: dict[str, object]) -> None:
+        if cancel_event.is_set():
+            raise _CancelledDownload(f"cancel requested for {aweme_id}")
+
     options = {
         "format": format_str,
         "outtmpl": out_tmpl,
@@ -158,6 +181,7 @@ def _download_with_ytdlp(aweme_id: str, out_tmpl: str, format_str: str, data_dir
         "no_warnings": True,
         "ignoreerrors": False,
         "http_headers": COMMON_HEADERS,
+        "progress_hooks": [_abort_if_cancelled],
     }
     cookie_path = data_dir / "douyin_cookies.txt"
     if cookie_path.exists():
@@ -193,6 +217,43 @@ def _verify_output(output_path: Path) -> None:
     """校验下载产物存在、非空、为有效 mp4；不通过即判失败。"""
     if not probe_mp4(output_path):
         raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(output_path))
+
+
+def _download_ytdlp_staged(
+    aweme_id: str,
+    output_path: Path,
+    temp_dir: Path,
+    format_str: str,
+    data_dir: Path,
+    cancel_event: threading.Event,
+) -> None:
+    """在工作线程内自持 yt-dlp 暂存目录的整个生命周期。
+
+    建目录 → 下载 → 定位产物 → 校验 → 原子发布 → 清理全部在**同一线程内顺序完成**，
+    因此取消/超时后取消方不会再并发删除目录，也不存在“目录被删后 worker 重新落盘”。
+    取消通过 ``cancel_event`` 协作式触发：下载中被进度钩子尽快中止，发布前若已取消则
+    丢弃暂存产物（保持“取消即无副作用”），成品路径只会经一次校验通过的原子改名写入。
+    """
+    work_dir = _staging_dir(temp_dir, aweme_id)
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        _download_with_ytdlp(
+            aweme_id, str(work_dir / f"{aweme_id}.%(ext)s"), format_str, data_dir, cancel_event
+        )
+        if cancel_event.is_set():
+            core.logger.warning(f"[Douyin] yt-dlp 已取消，丢弃暂存产物：{aweme_id}")
+            return
+        staged = _locate_staged_media(work_dir)
+        if staged is None:
+            raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(work_dir))
+        _verify_output(staged)
+        if cancel_event.is_set():
+            core.logger.warning(f"[Douyin] yt-dlp 已取消，放弃发布：{aweme_id}")
+            return
+        staged.replace(output_path)
+    finally:
+        # 只有 worker 自己（在被协作式取消或自然结束后）才删暂存目录；取消方不再并发清理。
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _discard(path: Path) -> None:
@@ -243,21 +304,16 @@ async def _download(
                 f"[Douyin] 无水印直链失败（{exc.kind.value}），降级 yt-dlp：{aweme_id} - {exc.detail}"
             )
 
-    # 档位二：yt-dlp。先写入唯一临时目录，待线程退出且校验通过后再原子发布成品；
-    # 任何失败/超时/取消都清理临时目录，绝不把中间产物留在 output_path 上——
-    # 既避免残留半成品被当成缓存，也避免迟到线程覆盖后续同一作品的新下载结果。
-    work_dir = _staging_dir(output_path.parent, aweme_id)
+    # 档位二：yt-dlp。整个暂存目录生命周期（建目录→下载→校验→原子发布→清理）都收拢在
+    # 同一个工作线程内完成：只有 worker 结束后才删目录，取消方不再并发清理，杜绝“清理与
+    # worker 并发”与“目录被删后 worker 重新落盘”。超时/取消仅通过 cancel_event 协作式
+    # 通知（进度钩子尽快中止下载），成品路径只会经一次校验通过的原子改名写入。
+    format_str = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
+    cancel_event = threading.Event()
     try:
-        await asyncio.to_thread(work_dir.mkdir, parents=True, exist_ok=True)
-        format_str = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
         await asyncio.to_thread(
-            _download_with_ytdlp, aweme_id, str(work_dir / f"{aweme_id}.%(ext)s"), format_str, data_dir
+            _download_ytdlp_staged, aweme_id, output_path, output_path.parent, format_str, data_dir, cancel_event
         )
-        staged = _locate_staged_media(work_dir)
-        if staged is None:
-            raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(work_dir))
-        await asyncio.to_thread(_verify_output, staged)
-        staged.replace(output_path)
         core.logger.success(f"[Douyin] yt-dlp 下载成功：{aweme_id}")
         return
     except MediaDownloadError as exc:
@@ -267,8 +323,9 @@ async def _download(
         last_error = MediaDownloadError(FailureKind.LOCAL, "yt-dlp 下载失败", detail=str(exc))
         core.logger.warning(f"[Douyin] yt-dlp 失败，继续降级：{aweme_id} - {exc}")
     finally:
-        # 同步清理，确保取消/超时路径（finally 中不能再 await）也能删除临时目录。
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # 仅发出协作式取消请求（同步、无 await，取消路径下也能执行）；暂存目录的清理由
+        # worker 线程在自己结束后完成，取消方绝不并发删除仍在使用的目录。
+        cancel_event.set()
 
     # 档位三：带水印 / 低码率地址。
     if watermark_url and watermark_url != video_url:
