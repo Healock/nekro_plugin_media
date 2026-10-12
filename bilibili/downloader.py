@@ -7,6 +7,7 @@ from pathlib import Path
 from nekro_agent.api import core
 from nekro_agent.api.plugin import dynamic_import_pkg
 
+from ..download_kit import find_completed_media, probe_mp4
 from .api import COMMON_HEADERS
 
 QUALITY_FORMATS = {
@@ -31,13 +32,8 @@ def auto_clean_temp_dir(temp_dir: Path, max_age_hours: int = 24) -> None:
 
 
 def find_cached_file(temp_dir: Path, bvid: str) -> Path | None:
-    for path in temp_dir.glob(f"{bvid}.*"):
-        try:
-            if path.is_file() and path.stat().st_size > 0:
-                return path
-        except OSError:
-            continue
-    return None
+    # 复用共享工具：只有精确命名的完成态成品文件才算命中，`.part` 等临时文件永不返回。
+    return find_completed_media(temp_dir, bvid, ".mp4")
 
 
 def background_download_task(bvid: str, output_path: str, format_str: str, data_dir: Path) -> None:
@@ -58,6 +54,9 @@ def background_download_task(bvid: str, output_path: str, format_str: str, data_
             options["cookiefile"] = str(cookie_path)
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([f"https://www.bilibili.com/video/{bvid}"])
+        # 兜底校验：yt-dlp 在 ignoreerrors 下可能不产生有效文件，这里显式确认并告警。
+        if not probe_mp4(Path(output_path)):
+            core.logger.error(f"[Bilibili] 下载产物校验未通过（{bvid}）：{output_path}")
     except Exception as exc:
         core.logger.error(f"[Bilibili] 下载失败（{bvid}）：{exc}")
 

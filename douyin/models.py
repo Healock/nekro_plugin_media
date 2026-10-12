@@ -185,6 +185,8 @@ class DouyinContext(BaseModel):
     duration: int = 0
     create_time: int = 0
     video_url: str | None = None
+    # 带水印 / 低码率的原始播放地址，用作直链与 yt-dlp 均失败后的最后降级档位。
+    video_url_watermarked: str | None = None
     cover_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
     digg_count: int = 0
@@ -223,10 +225,13 @@ class DouyinContext(BaseModel):
                     image_urls.append(url)
 
         video_url = None
+        video_url_watermarked = None
         cover_url = None
         duration = 0
         if video:
-            video_url = resolve_play_url(video.get("play_addr"))
+            play_addr = video.get("play_addr")
+            video_url_watermarked = _first_url(play_addr)
+            video_url = resolve_play_url(play_addr)
             cover_url = _first_url(video.get("cover"))
             duration = _to_seconds(video.get("duration"))
 
@@ -238,6 +243,7 @@ class DouyinContext(BaseModel):
             duration=duration,
             create_time=_to_int(item.get("create_time")),
             video_url=video_url,
+            video_url_watermarked=video_url_watermarked,
             cover_url=cover_url,
             image_urls=image_urls,
             digg_count=_to_int(statistics.get("digg_count")),

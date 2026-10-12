@@ -75,6 +75,13 @@ def test_video_item_is_parsed_without_watermark() -> None:
     assert not context.is_gallery
 
 
+def test_video_item_exposes_watermarked_fallback_url() -> None:
+    context = models.DouyinContext.from_item(_video_item())
+    # 去水印地址用于主档位，原始带水印地址保留为最后降级档位。
+    assert context.video_url_watermarked == "https://aweme.snssdk.com/aweme/v1/playwm/?video_id=v0200"
+    assert context.video_url == "https://aweme.snssdk.com/aweme/v1/play/?video_id=v0200"
+
+
 def test_from_router_data_locates_item() -> None:
     router = {"loaderData": {"video_(id)/page": {"videoInfoRes": {"item_list": [_video_item()]}}}}
     context = models.DouyinContext.from_router_data(router)

@@ -31,6 +31,7 @@ nekro_plugin_media/
 ├── commands.py       # 管理命令
 ├── lifecycle.py      # 生命周期清理
 ├── types.py          # 媒体类型和处理状态
+├── download_kit.py   # 通用下载工具：完成态判定、原子落盘、并发去重、有限重试与统一异常
 ├── bilibili/         # Bilibili 子模块，不是独立 Nekro 插件
 └── douyin/           # 抖音子模块，不是独立 Nekro 插件
 ```
@@ -53,6 +54,20 @@ nekro_plugin_media/
   Cookie `ttwid` 后重试（仍不含登录态与签名）。
 - 直链下载失败时，回退到 `yt-dlp`（复用与 Bilibili 相同的动态依赖）。
 
+## 下载失败处理
+
+抖音下载链路（以及共用的 `download_kit.py`）遵循以下约定：
+
+- **完成态判定**：只有落盘的成品文件才算缓存命中，`.part` 及任何临时/分片文件永不对外可见；
+  下载先写 `<id>.mp4.part`，校验通过后原子改名成 `<id>.mp4`。
+- **并发去重**：同一 `aweme_id` 进行中的下载复用同一后台任务，失败后立即释放，避免重复下载与文件竞态。
+- **分级降级**：按 无水印直链 → `yt-dlp` → 带水印/低码率地址 依次尝试，并记录实际命中的档位。
+- **有限重试**：仅对网络抖动 / 5xx / 超时（`NETWORK`/`SERVER`/`TIMEOUT`）重试，最多 2 次、退避 1s/3s，绝不无限重试。
+- **凭证刷新**：分享页返回 401/403 或空壳页时判定 `ttwid` 失效，清缓存重新注册后仅重试一次。
+- **永久失败不重试**：作品不存在/已删除/私密/地域限制/需登录直接给出可读原因。
+- **总超时**：整个下载流程受 `douyin_download_timeout`（默认 180 秒）约束，超时/取消都会清理临时文件。
+- **不静默**：解析失败、下载失败与超时都会向来源聊天推送一条可读提示，而不仅是写日志。
+
 ## 配置
 
 | 配置项 | 默认值 | 说明 |
@@ -68,6 +83,7 @@ nekro_plugin_media/
 | `douyin_download_quality` | `720p` | 抖音 yt-dlp 兜底下载画质 |
 | `douyin_max_duration` | `30` | 抖音视频最大时长，单位为分钟 |
 | `douyin_desc_char_limit` | `150` | 抖音文案截断长度 |
+| `douyin_download_timeout` | `180` | 抖音下载总超时，单位为秒 |
 | `NAPCAT_TEMP_DIR` | `/app/.config/QQ/NapCat/temp` | NapCat 临时文件目录 |
 
 ## 外部依赖

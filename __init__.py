@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="媒体阅读器",
     module_name="nekro_plugin_media",
     description="处理 OneBot 音视频与 Bilibili / 抖音分享链接，按需调用 Nekro 模型组提取媒体内容。",
-    version="1.2.0",
+    version="1.3.0",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_media",
     support_adapter=["onebot_v11"],
@@ -49,6 +49,7 @@ class MediaConfig(ConfigBase):
     )
     douyin_max_duration: int = Field(default=30, title="抖音最大时长（分钟）")
     douyin_desc_char_limit: int = Field(default=150, title="抖音文案截断长度")
+    douyin_download_timeout: int = Field(default=180, title="抖音下载总超时（秒）")
     NAPCAT_TEMP_DIR: str = Field(default="/app/.config/QQ/NapCat/temp", title="NapCat 临时目录")
 
 
