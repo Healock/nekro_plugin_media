@@ -169,3 +169,90 @@ def test_download_falls_back_to_watermark_tier(monkeypatch: pytest.MonkeyPatch, 
 
     asyncio.run(scenario())
     assert "https://v/playwm" in seen  # 命中第三档位
+
+
+def _write_staged(out_tmpl: str, aweme_id: str, payload: bytes) -> Path:
+    """模拟 yt-dlp：只在给定的唯一临时目录内落盘，绝不直接写 output_path。"""
+    staged = Path(out_tmpl).parent / f"{aweme_id}.mp4"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(payload)
+    return staged
+
+
+def test_ytdlp_staging_dir_is_unique() -> None:
+    base = Path("/tmp/nekro-douyin-test")
+    first = downloader._staging_dir(base, "123")
+    second = downloader._staging_dir(base, "123")
+    assert first != second
+    assert first.parent == base
+    assert first.name.startswith(".ytdlp-123-")
+
+
+def test_ytdlp_success_publishes_staged_output_and_removes_staging_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    received: list[str] = []
+
+    def fake_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+        received.append(out_tmpl)
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(downloader, "_verify_output", lambda _path: None)
+
+    async def scenario() -> None:
+        out = tmp_path / "5.mp4"
+        await downloader._download("5", out, None, None, "720p", tmp_path)
+        assert out.read_bytes() == _FTYP_HEADER  # 校验通过后原子发布到成品路径
+
+    asyncio.run(scenario())
+    # yt-dlp 写入的是唯一临时目录，而不是 output_path 本身。
+    assert received and Path(received[0]).parent.name.startswith(".ytdlp-5-")
+    assert Path(received[0]).parent != tmp_path
+    # 发布后临时目录被清理，不留残留。
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_ytdlp_failure_leaves_no_output_and_cleans_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def failing_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+        # 失败前已写入带 ftyp 头的半成品，正好覆盖“截断文件被误判缓存”的场景。
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+        raise RuntimeError("yt-dlp boom")
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", failing_ytdlp)
+
+    async def scenario() -> None:
+        out = tmp_path / "6.mp4"
+        with pytest.raises(kit.MediaDownloadError):
+            await downloader._download("6", out, None, None, "720p", tmp_path)
+        # 失败档位绝不把中间产物留在 output_path 上，也不留临时目录。
+        assert not out.exists()
+        assert downloader.find_cached_file(tmp_path, "6") is None
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_ytdlp_verify_failure_discards_staged_without_publishing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_ytdlp(aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path) -> None:
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+
+    def reject(_path: Path) -> None:
+        raise kit.MediaDownloadError(kit.FailureKind.INVALID, "校验未通过")
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(downloader, "_verify_output", reject)
+
+    async def scenario() -> None:
+        out = tmp_path / "7.mp4"
+        with pytest.raises(kit.MediaDownloadError):
+            await downloader._download("7", out, None, None, "720p", tmp_path)
+        assert not out.exists()
+        assert downloader.find_cached_file(tmp_path, "7") is None
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []

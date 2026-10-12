@@ -58,8 +58,10 @@ nekro_plugin_media/
 
 抖音下载链路（以及共用的 `download_kit.py`）遵循以下约定：
 
-- **完成态判定**：只有落盘的成品文件才算缓存命中，`.part` 及任何临时/分片文件永不对外可见；
-  下载先写 `<id>.mp4.part`，校验通过后原子改名成 `<id>.mp4`。
+- **完成态判定**：只有落盘的成品文件才算缓存命中，`.part`、`.ytdlp-*` 等临时/分片文件永不对外可见。
+- **原子发布**：直链档位先写 `<id>.mp4.part`，校验通过后原子改名为 `<id>.mp4`；`yt-dlp` 档位先写入唯一临时
+  目录 `.ytdlp-<id>-<uuid>/`，待线程退出且校验通过后再原子改名到成品路径。任何失败/超时/取消都会清理临时文件
+  或目录，因此成品永远是被校验过的完整文件，也不会因迟到线程而覆盖后续同一作品的新下载结果。
 - **并发去重**：同一 `aweme_id` 进行中的下载复用同一后台任务，失败后立即释放，避免重复下载与文件竞态。
 - **分级降级**：按 无水印直链 → `yt-dlp` → 带水印/低码率地址 依次尝试，并记录实际命中的档位。
 - **有限重试**：仅对网络抖动 / 5xx / 超时（`NETWORK`/`SERVER`/`TIMEOUT`）重试，最多 2 次、退避 1s/3s，绝不无限重试。
@@ -114,11 +116,19 @@ nekro_plugin_media/
 python -m py_compile *.py bilibili\*.py douyin\*.py
 ```
 
-抖音分享页解析等纯逻辑可用 pytest 验证（`tests/` 目录），无需真实网络：
+抖音分享页解析、下载失败处理等纯逻辑可用 pytest 验证（`tests/` 目录），无需真实网络。测试自带最小
+NekroAgent 桩，**独立 clone（无需 `nekro-agent` 源码）即可运行**：
 
-```powershell
-python -m pytest tests
+```bash
+# 在仓库根目录（推荐；注意用 pytest 命令而非 python -m pytest）：
+pytest
+
+# 或从上级目录执行：
+python -m pytest <目录名>/tests
 ```
+
+> 注意：仓库根的 `types.py` 会遮蔽标准库 `types`，因此从仓库根执行 `python -m pytest` 会在解释器启动阶段
+> 失败（与测试代码无关）；此时请改用 `pytest` 命令，或从上级目录运行。
 
 插件会优先使用 `MEDIA_MODEL_GROUP`。旧版 `GEMINI_API_KEY` 和 `GEMINI_MODEL` 仅在未设置模型组时作为回退，不建议新部署继续填写。
 

@@ -1,15 +1,20 @@
 """抖音视频下载：无水印直链 → yt-dlp → 带水印/低码率 三级降级。
 
 失败统一以 :class:`MediaDownloadError` 抛出（不再吞异常），由调用方转换为用户可见提示。
-下载全程写入 ``.part`` 临时文件，校验通过后原子落盘；任何异常、取消或超时都会清理临时文件。
+所有档位都先把产物写入临时位置，校验通过后才原子改名到 ``output_path``：直链档位写
+``.part``，yt-dlp 档位写唯一临时目录 ``.ytdlp-<id>-<uuid>/``。因此成品文件永远只会是
+被校验过的完整文件；任何异常、取消或超时都会清理临时文件/目录，绝不残留可能被误判为
+缓存的半成品，也避免迟到线程覆盖后续同一作品的新下载结果。
 同一 ``aweme_id`` 的并发请求复用同一后台任务，避免重复下载与文件竞态。
 """
 
 from __future__ import annotations
 
 import asyncio
+import shutil
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import aiohttp
 from nekro_agent.api import core
@@ -58,7 +63,13 @@ def auto_clean_temp_dir(temp_dir: Path, max_age_hours: int = 24) -> None:
     cutoff = time.time() - max_age_hours * 3600
     try:
         for path in temp_dir.iterdir():
-            if path.is_file() and path.stat().st_mtime < cutoff:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            if path.is_dir():
+                # 仅清理下载专用的暂存目录，避免误删缓存目录中的其它内容。
+                if path.name.startswith(".ytdlp-"):
+                    shutil.rmtree(path, ignore_errors=True)
+            elif path.is_file():
                 path.unlink()
     except (OSError, ValueError) as exc:
         core.logger.warning(f"[Douyin] 缓存清理失败：{exc}")
@@ -130,12 +141,17 @@ async def _download_direct(video_url: str, output_path: Path, referer: str) -> N
             raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(output_path))
 
 
-def _download_with_ytdlp(aweme_id: str, output_path: str, format_str: str, data_dir: Path) -> None:
-    """yt-dlp 兜底下载（在线程中执行）。失败会抛异常，不再以 ignoreerrors 静默。"""
+def _download_with_ytdlp(aweme_id: str, out_tmpl: str, format_str: str, data_dir: Path) -> None:
+    """yt-dlp 兜底下载（在线程中执行）。
+
+    写入调用方给定的**唯一临时输出模板**；失败会抛异常，不再以 ``ignoreerrors`` 静默。
+    真正的成品由调用方在“线程退出且校验通过”后原子发布，因此本函数绝不会直接写
+    ``output_path``——即使线程被超时/取消后迟到，也只会在自己的临时目录内产生文件。
+    """
     yt_dlp = dynamic_import_pkg("yt-dlp>=2025.1.15", import_name="yt_dlp")
     options = {
         "format": format_str,
-        "outtmpl": output_path,
+        "outtmpl": out_tmpl,
         "merge_output_format": "mp4",
         "concurrent_fragment_downloads": 10,
         "quiet": True,
@@ -148,6 +164,29 @@ def _download_with_ytdlp(aweme_id: str, output_path: str, format_str: str, data_
         options["cookiefile"] = str(cookie_path)
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([f"https://www.douyin.com/video/{aweme_id}"])
+
+
+def _staging_dir(temp_dir: Path, aweme_id: str) -> Path:
+    """为一次 yt-dlp 尝试分配唯一临时目录，隔离并发请求与迟到线程的写入。"""
+    return temp_dir / f".ytdlp-{aweme_id}-{uuid4().hex}"
+
+
+def _locate_staged_media(work_dir: Path) -> Path | None:
+    """在临时目录中定位 yt-dlp 产出的成品，忽略 ``.part``/``.ytdl`` 等中间文件。
+
+    正常情况下成功下载后目录内只剩最终媒体文件；若仍残留分片，取体积最大的
+    ``mp4`` 文件，交由其后的校验决定是否可用。
+    """
+    if not work_dir.is_dir():
+        return None
+    files = [
+        path
+        for path in work_dir.iterdir()
+        if path.is_file() and not path.name.endswith((".part", ".ytdl"))
+    ]
+    if not files:
+        return None
+    return max(files, key=lambda path: (path.suffix.lower() == ".mp4", path.stat().st_size))
 
 
 def _verify_output(output_path: Path) -> None:
@@ -204,11 +243,21 @@ async def _download(
                 f"[Douyin] 无水印直链失败（{exc.kind.value}），降级 yt-dlp：{aweme_id} - {exc.detail}"
             )
 
-    # 档位二：yt-dlp。
+    # 档位二：yt-dlp。先写入唯一临时目录，待线程退出且校验通过后再原子发布成品；
+    # 任何失败/超时/取消都清理临时目录，绝不把中间产物留在 output_path 上——
+    # 既避免残留半成品被当成缓存，也避免迟到线程覆盖后续同一作品的新下载结果。
+    work_dir = _staging_dir(output_path.parent, aweme_id)
     try:
+        await asyncio.to_thread(work_dir.mkdir, parents=True, exist_ok=True)
         format_str = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
-        await asyncio.to_thread(_download_with_ytdlp, aweme_id, str(output_path), format_str, data_dir)
-        await asyncio.to_thread(_verify_output, output_path)
+        await asyncio.to_thread(
+            _download_with_ytdlp, aweme_id, str(work_dir / f"{aweme_id}.%(ext)s"), format_str, data_dir
+        )
+        staged = _locate_staged_media(work_dir)
+        if staged is None:
+            raise MediaDownloadError(FailureKind.INVALID, "下载的视频校验未通过", detail=str(work_dir))
+        await asyncio.to_thread(_verify_output, staged)
+        staged.replace(output_path)
         core.logger.success(f"[Douyin] yt-dlp 下载成功：{aweme_id}")
         return
     except MediaDownloadError as exc:
@@ -217,7 +266,9 @@ async def _download(
     except Exception as exc:  # noqa: BLE001 - yt-dlp 的第三方异常需统一收口
         last_error = MediaDownloadError(FailureKind.LOCAL, "yt-dlp 下载失败", detail=str(exc))
         core.logger.warning(f"[Douyin] yt-dlp 失败，继续降级：{aweme_id} - {exc}")
-    _discard(part_path(output_path))
+    finally:
+        # 同步清理，确保取消/超时路径（finally 中不能再 await）也能删除临时目录。
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     # 档位三：带水印 / 低码率地址。
     if watermark_url and watermark_url != video_url:
