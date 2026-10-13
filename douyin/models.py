@@ -187,6 +187,8 @@ class DouyinContext(BaseModel):
     video_url: str | None = None
     # 带水印 / 低码率的原始播放地址，用作直链与 yt-dlp 均失败后的最后降级档位。
     video_url_watermarked: str | None = None
+    # 仅供本次下载请求使用，不参与序列化或提示词，避免匿名 Cookie 泄漏到日志/历史。
+    download_cookie: str | None = Field(default=None, exclude=True, repr=False)
     cover_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
     digg_count: int = 0

@@ -66,6 +66,7 @@ _ensure_package_stub("nekro_plugin_media", PLUGIN_DIR)
 _ensure_package_stub("nekro_plugin_media.douyin", PLUGIN_DIR / "douyin")
 
 downloader = importlib.import_module("nekro_plugin_media.douyin.downloader")
+douyin_api = importlib.import_module("nekro_plugin_media.douyin.api")
 kit = importlib.import_module("nekro_plugin_media.download_kit")
 
 
@@ -172,6 +173,63 @@ def test_download_falls_back_to_watermark_tier(monkeypatch: pytest.MonkeyPatch, 
 
     asyncio.run(scenario())
     assert "https://v/playwm" in seen  # 命中第三档位
+
+
+def test_ytdlp_receives_runtime_cookie_when_no_cookie_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            captured.update(options)
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def download(self, _urls: list[str]) -> None:
+            return None
+
+    fake_yt_dlp = types.ModuleType("yt_dlp")
+    fake_yt_dlp.YoutubeDL = FakeYoutubeDL  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "yt_dlp", fake_yt_dlp)
+
+    downloader._download_with_ytdlp(
+        "cookie-test",
+        str(tmp_path / "cookie-test.%(ext)s"),
+        "best",
+        tmp_path,
+        threading.Event(),
+        "ttwid=runtime-cookie",
+    )
+
+    headers = captured["http_headers"]
+    assert isinstance(headers, dict)
+    assert headers["Cookie"] == "ttwid=runtime-cookie"
+    assert "cookiefile" not in captured
+
+
+def test_share_page_cookie_is_attached_to_download_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = {
+        "desc": "test",
+        "video": {"play_addr": {"url_list": ["https://v.example/playwm/video"]}},
+    }
+    router_data = {"loaderData": {"page": {"videoInfoRes": {"item_list": [item]}}}}
+
+    async def fake_fetch(_session: object, _url: str, _headers: dict[str, str]):
+        return 200, "window._ROUTER_DATA = " + __import__("json").dumps(router_data)
+
+    monkeypatch.setattr(douyin_api, "_fetch_share_page", fake_fetch)
+
+    async def scenario() -> None:
+        context = await douyin_api._try_share_pages(object(), "123", "ttwid=runtime-cookie")
+        assert context is not None
+        assert context.download_cookie == "ttwid=runtime-cookie"
+
+    asyncio.run(scenario())
 
 
 def _write_staged(out_tmpl: str, aweme_id: str, payload: bytes) -> Path:
