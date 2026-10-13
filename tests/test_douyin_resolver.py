@@ -67,3 +67,34 @@ def test_dtk_success_does_not_call_native(monkeypatch) -> None:
 
     asyncio.run(resolver.resolve_context("https://www.douyin.com/video/123456789012345", Config()))
     assert calls == ["id", "dtk"]
+
+
+def test_media_parser_success_does_not_call_native(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def immediate(operation):
+        return await operation()
+
+    async def fake_resolve(_url):
+        calls.append("id")
+        return "123456789012345"
+
+    async def fake_media_parser(_url, _config):
+        calls.append("media_parser")
+        return object()
+
+    async def fake_native(_aweme_id):
+        calls.append("native")
+        return object()
+
+    monkeypatch.setattr(resolver, "_retry", immediate)
+    monkeypatch.setattr(resolver, "resolve_aweme_id", fake_resolve)
+    monkeypatch.setattr(resolver, "fetch_media_parser_context", fake_media_parser)
+    monkeypatch.setattr(resolver, "fetch_douyin_context", fake_native)
+
+    class Config:
+        douyin_api_provider = "media_parser"
+        douyin_api_base_url = "http://media-parser:8051"
+
+    asyncio.run(resolver.resolve_context("https://www.douyin.com/video/123456789012345", Config()))
+    assert calls == ["id", "media_parser"]

@@ -272,6 +272,40 @@ class DouyinContext(BaseModel):
         )
 
     @classmethod
+    def from_media_parser_data(cls, data: dict) -> "DouyinContext":
+        """Map ucmao/media-parser's flat response contract."""
+        image_urls: list[str] = []
+        raw_images = data.get("image_list")
+        if isinstance(raw_images, list):
+            for image in raw_images:
+                candidate = image.get("url") if isinstance(image, dict) else image
+                if is_safe_media_url(candidate):
+                    image_urls.append(candidate)
+
+        author = data.get("author")
+        if isinstance(author, dict):
+            author = author.get("nickname") or author.get("name")
+        video_url = data.get("video_url") or data.get("source_video_url")
+        if not is_safe_media_url(video_url):
+            video_url = None
+        video_list = data.get("video_list")
+        if not video_url and isinstance(video_list, list):
+            video_url = next((url for url in video_list if is_safe_media_url(url)), None)
+        duration = (
+            _to_seconds(data.get("duration_ms"))
+            if data.get("duration_ms") is not None
+            else _to_int(data.get("duration"))
+        )
+        return cls(
+            desc=str(data.get("desc") or data.get("title") or ""),
+            author=str(author or "未知作者"),
+            duration=duration,
+            video_url=str(video_url) if video_url else None,
+            image_urls=image_urls,
+            cover_url=data.get("cover_url") if is_safe_media_url(data.get("cover_url")) else None,
+        )
+
+    @classmethod
     def from_router_data(cls, router_data: dict) -> "DouyinContext | None":
         item = find_item(router_data)
         if item is None:
