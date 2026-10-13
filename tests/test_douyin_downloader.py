@@ -1,0 +1,377 @@
+"""抖音下载器失败路径集成测试。
+
+直接加载 ``douyin/downloader.py``（通过预注册包桩跳过会引入 nonebot 的
+``douyin/__init__.py``），并用轻量 ``nekro_agent`` 桩替代运行时依赖，
+从而在没有真实 NekroAgent / 网络的环境下覆盖：缓存命中判定、并发去重、
+降级链与失败传播。真实网络与 aiohttp 传输层不在本测试范围内。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import importlib.util
+import logging
+import sys
+import threading
+import types
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("aiohttp")
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+
+_FTYP_HEADER = b"\x00\x00\x00\x18ftypisom"
+
+
+def _install_nekro_stub() -> None:
+    if importlib.util.find_spec("nekro_agent") is not None:
+        return
+    package = types.ModuleType("nekro_agent")
+    api = types.ModuleType("nekro_agent.api")
+    core = types.ModuleType("nekro_agent.api.core")
+    core.logger = logging.getLogger("nekro_agent.stub")
+    core.logger.success = core.logger.info  # Nekro 日志器提供 success，标准 logging 没有
+    plugin = types.ModuleType("nekro_agent.api.plugin")
+
+    def dynamic_import_pkg(spec: str, import_name: str | None = None, **_kwargs: object) -> object:
+        return importlib.import_module(import_name or spec.split(">=")[0].strip())
+
+    plugin.dynamic_import_pkg = dynamic_import_pkg
+    api.core = core
+    api.plugin = plugin
+    package.api = api
+    for name, module in {
+        "nekro_agent": package,
+        "nekro_agent.api": api,
+        "nekro_agent.api.core": core,
+        "nekro_agent.api.plugin": plugin,
+    }.items():
+        sys.modules.setdefault(name, module)
+
+
+def _ensure_package_stub(name: str, path: Path) -> None:
+    """注册一个仅有 __path__ 的包，避免执行真实的包 __init__（其中会导入 nonebot）。"""
+    if name in sys.modules:
+        return
+    module = types.ModuleType(name)
+    module.__path__ = [str(path)]  # type: ignore[attr-defined]
+    sys.modules[name] = module
+
+
+_install_nekro_stub()
+_ensure_package_stub("nekro_plugin_media", PLUGIN_DIR)
+_ensure_package_stub("nekro_plugin_media.douyin", PLUGIN_DIR / "douyin")
+
+downloader = importlib.import_module("nekro_plugin_media.douyin.downloader")
+kit = importlib.import_module("nekro_plugin_media.download_kit")
+
+
+def test_find_cached_file_ignores_part(tmp_path: Path) -> None:
+    (tmp_path / "123.mp4.part").write_bytes(_FTYP_HEADER)
+    assert downloader.find_cached_file(tmp_path, "123") is None
+    (tmp_path / "123.mp4").write_bytes(_FTYP_HEADER)
+    found = downloader.find_cached_file(tmp_path, "123")
+    assert found is not None
+    assert found.name == "123.mp4"
+
+
+def test_schedule_download_dedupes_inflight_and_releases(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_download(*_args: object, **_kwargs: object) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(downloader, "_download", fake_download)
+    out_dir = Path("/tmp/nekro-douyin-test")
+
+    async def scenario() -> None:
+        out = out_dir / "123.mp4"
+        first = downloader.schedule_download("123", out, "https://v", "720p", out_dir)
+        await started.wait()
+        second = downloader.schedule_download("123", out, "https://v", "720p", out_dir)
+        assert second is first  # 进行中复用同一任务
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        await asyncio.sleep(0)
+        # 任务结束后条目被清理，可再次启动新任务
+        third = downloader.schedule_download("123", out, "https://v", "720p", out_dir)
+        assert third is not first
+        await asyncio.gather(third, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_schedule_download_releases_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def failing(*_args: object, **_kwargs: object) -> None:
+        raise kit.MediaDownloadError(kit.FailureKind.NETWORK, "boom")
+
+    monkeypatch.setattr(downloader, "_download", failing)
+    out_dir = Path("/tmp/nekro-douyin-test")
+
+    async def scenario() -> None:
+        out = out_dir / "9.mp4"
+        first = downloader.schedule_download("9", out, "https://v", "720p", out_dir)
+        with pytest.raises(kit.MediaDownloadError):
+            await first
+        await asyncio.sleep(0)
+        second = downloader.schedule_download("9", out, "https://v", "720p", out_dir)
+        assert second is not first  # 失败结果不被永久复用
+        with pytest.raises(kit.MediaDownloadError):
+            await second
+
+    asyncio.run(scenario())
+
+
+def test_download_propagates_permanent_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    async def permanent(*_args: object, **_kwargs: object) -> None:
+        calls["n"] += 1
+        raise kit.MediaDownloadError(kit.FailureKind.UNAVAILABLE, "gone")
+
+    monkeypatch.setattr(downloader, "_download_direct", permanent)
+    monkeypatch.setattr(downloader, "_RETRY_BACKOFF", (0.0, 0.0))
+
+    async def scenario() -> None:
+        with pytest.raises(kit.MediaDownloadError):
+            await downloader._download(
+                "42", tmp_path / "42.mp4", "https://v/nowm", "https://v/wm", "720p", tmp_path, threading.Event()
+            )
+        assert calls["n"] == 1  # 永久失败既不重试也不降级
+
+    asyncio.run(scenario())
+
+
+def test_download_falls_back_to_watermark_tier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[str] = []
+
+    async def fake_direct(url: str, output_path: Path, _referer: str) -> None:
+        seen.append(url)
+        if "playwm" not in url:
+            raise kit.MediaDownloadError(kit.FailureKind.NETWORK, "transient")
+        output_path.write_bytes(_FTYP_HEADER)  # 模拟带水印档位成功落盘
+
+    def fake_ytdlp(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("yt-dlp 不可用")
+
+    monkeypatch.setattr(downloader, "_download_direct", fake_direct)
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(downloader, "_RETRY_BACKOFF", (0.0, 0.0))
+
+    async def scenario() -> None:
+        out = tmp_path / "7.mp4"
+        await downloader._download(
+            "7", out, "https://v/play", "https://v/playwm", "720p", tmp_path, threading.Event()
+        )
+        assert out.exists()
+
+    asyncio.run(scenario())
+    assert "https://v/playwm" in seen  # 命中第三档位
+
+
+def _write_staged(out_tmpl: str, aweme_id: str, payload: bytes) -> Path:
+    """模拟 yt-dlp：只在给定的唯一临时目录内落盘，绝不直接写 output_path。"""
+    staged = Path(out_tmpl).parent / f"{aweme_id}.mp4"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(payload)
+    return staged
+
+
+def test_ytdlp_staging_dir_is_unique() -> None:
+    base = Path("/tmp/nekro-douyin-test")
+    first = kit.staging_dir(base, "123")
+    second = kit.staging_dir(base, "123")
+    assert first != second
+    assert first.parent == base
+    assert first.name.startswith(".ytdlp-123-")
+
+
+def test_ytdlp_success_publishes_staged_output_and_removes_staging_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    received: list[str] = []
+
+    def fake_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
+        received.append(out_tmpl)
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(downloader, "_verify_output", lambda _path: None)
+
+    async def scenario() -> None:
+        out = tmp_path / "5.mp4"
+        await downloader._download("5", out, None, None, "720p", tmp_path, threading.Event())
+        assert out.read_bytes() == _FTYP_HEADER  # 校验通过后原子发布到成品路径
+
+    asyncio.run(scenario())
+    # yt-dlp 写入的是唯一临时目录，而不是 output_path 本身。
+    assert received and Path(received[0]).parent.name.startswith(".ytdlp-5-")
+    assert Path(received[0]).parent != tmp_path
+    # 发布后临时目录被清理，不留残留。
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_ytdlp_failure_leaves_no_output_and_cleans_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def failing_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
+        # 失败前已写入带 ftyp 头的半成品，正好覆盖“截断文件被误判缓存”的场景。
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+        raise RuntimeError("yt-dlp boom")
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", failing_ytdlp)
+
+    async def scenario() -> None:
+        out = tmp_path / "6.mp4"
+        with pytest.raises(kit.MediaDownloadError):
+            await downloader._download("6", out, None, None, "720p", tmp_path, threading.Event())
+        # 失败档位绝不把中间产物留在 output_path 上，也不留临时目录。
+        assert not out.exists()
+        assert downloader.find_cached_file(tmp_path, "6") is None
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_ytdlp_verify_failure_discards_staged_without_publishing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
+        _write_staged(out_tmpl, aweme_id, _FTYP_HEADER)
+
+    def reject(_path: Path) -> None:
+        raise kit.MediaDownloadError(kit.FailureKind.INVALID, "校验未通过")
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(downloader, "_verify_output", reject)
+
+    async def scenario() -> None:
+        out = tmp_path / "7.mp4"
+        with pytest.raises(kit.MediaDownloadError):
+            await downloader._download("7", out, None, None, "720p", tmp_path, threading.Event())
+        assert not out.exists()
+        assert downloader.find_cached_file(tmp_path, "7") is None
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_cancel_while_worker_running_defers_cleanup_to_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """下载线程尚未退出时取消任务：cleanup 由 worker 自己收尾，不与取消方并发。
+
+    线程无法被强制终止，因此取消只发协作信号。断言：
+    - 取消方在 worker 仍运行时**不得**删除暂存目录（避免并发清理）；
+    - worker 收到取消信号后丢弃产物、由自己删除暂存目录，最终无残留、未发布成品。
+    """
+    started = threading.Event()
+    release = threading.Event()
+    observed: dict[str, bool] = {}
+
+    def blocking_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, cancel_event: threading.Event
+    ) -> None:
+        # 模拟“线程尚未退出”：先在暂存目录落个半成品再阻塞，等测试放行。
+        Path(out_tmpl).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_tmpl).parent.joinpath(f"{aweme_id}.mp4").write_bytes(_FTYP_HEADER)
+        started.set()
+        release.wait(timeout=5.0)
+        observed["cancel_set"] = cancel_event.is_set()
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", blocking_ytdlp)
+
+    async def scenario() -> None:
+        out = tmp_path / "8.mp4"
+        cancel_event = threading.Event()
+        task = asyncio.create_task(
+            downloader._download_guarded("8", out, None, None, "720p", tmp_path, 30.0, cancel_event)
+        )
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "worker 线程应已进入阻塞"
+        assert list(tmp_path.glob(".ytdlp-*")), "worker 运行期间暂存目录应存在"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # 取消后 worker 仍在运行：取消方不得抢先删除它仍在使用的暂存目录。
+        assert list(tmp_path.glob(".ytdlp-*")), "取消方不得与 worker 并发清理暂存目录"
+        assert cancel_event.is_set(), "取消路径应置位协作式取消信号"
+
+        release.set()  # 放行 worker，交由它自行收尾
+        for _ in range(500):
+            if not list(tmp_path.glob(".ytdlp-*")):
+                break
+            await asyncio.sleep(0.01)
+        assert list(tmp_path.glob(".ytdlp-*")) == [], "worker 结束后应无残留暂存目录"
+        assert not out.exists(), "取消后不得发布成品"
+        assert observed.get("cancel_set") is True, "worker 应观察到协作式取消信号"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_all_waits_for_worker_before_releasing_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """取消后应等 worker 真正退出再释放登记，避免“旧 worker 未退 + 同 id 新任务”的重复下载。
+
+    模拟“无进度回调的长阻塞”：worker 不响应取消信号直到被放行。断言 ``cancel_download_tasks``
+    在 worker 退出前**不返回**、登记**不释放**；worker 退出后才释放，且同 id 重新调度得到全新任务。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
+        Path(out_tmpl).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_tmpl).parent.joinpath(f"{aweme_id}.mp4").write_bytes(_FTYP_HEADER)
+        started.set()
+        release.wait(timeout=5.0)
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", blocking_ytdlp)
+    # 夹具只写 ftyp 头；固定校验器为 no-op，避免依赖真实 ffprobe 是否安装（否则“第二次下载发布”
+    # 会因 ffprobe 判定非完整 mp4 而随机失败）。
+    monkeypatch.setattr(downloader, "_verify_output", lambda _path: None)
+
+    async def scenario() -> None:
+        out = tmp_path / "11.mp4"
+        task = downloader.schedule_download("11", out, None, "720p", tmp_path)
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "worker 线程应已进入阻塞"
+
+        cancelling = asyncio.create_task(downloader.cancel_download_tasks())
+        await asyncio.sleep(0.05)
+        # worker 尚未退出：cancel_all 仍在等待，登记未释放，尚不允许同 id 重登。
+        assert not cancelling.done(), "cancel_all 应等待 worker 退出后才返回"
+        assert downloader._DOWNLOADS.get("11") is task, "worker 未退出前不得释放登记"
+
+        release.set()  # 放行 worker
+        await asyncio.wait_for(cancelling, timeout=5.0)
+        assert downloader._DOWNLOADS.get("11") is None, "worker 退出后应释放登记"
+        assert not out.exists(), "取消后不得发布成品"
+
+        # 登记释放后同 id 重新调度得到全新任务（旧任务已结束，不会与新任务并存重复下载）。
+        again = downloader.schedule_download("11", out, None, "720p", tmp_path)
+        assert again is not task
+        await asyncio.wait_for(again, timeout=5.0)
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []

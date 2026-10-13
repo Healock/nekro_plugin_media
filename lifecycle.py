@@ -5,6 +5,7 @@ import os
 
 from . import MEDIA_CACHE, background_tasks, generated_temp_files, plugin
 from .bilibili.registration import cleanup as cleanup_bilibili
+from .douyin.registration import cleanup as cleanup_douyin
 from .matcher import media_interceptor
 from .matcher_cleanup import destroy_matcher
 
@@ -17,6 +18,7 @@ async def cleanup() -> None:
         await asyncio.gather(*background_tasks, return_exceptions=True)
     background_tasks.clear()
     await cleanup_bilibili()
+    await cleanup_douyin()
     for path in list(generated_temp_files):
         try:
             if path.exists():

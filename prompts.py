@@ -23,7 +23,7 @@ def build_media_prompt(
         "【输出要求】",
         output,
     ]
-    if kind is MediaType.VIDEO and _is_bilibili_context(context_text):
+    if kind is MediaType.VIDEO and _has_streaming_context(context_text):
         lines.append("如来源包含长流媒体信息，另加一节【核心总结】，结合标题和评论提炼主旨。")
     lines.extend(["【来源】", sender_name or "群友"])
     if context_text.strip():
@@ -34,6 +34,6 @@ def build_media_prompt(
     return "\n".join(lines)
 
 
-def _is_bilibili_context(context_text: str) -> bool:
+def _has_streaming_context(context_text: str) -> bool:
     lowered = context_text.casefold()
-    return any(marker in lowered for marker in ("b站", "bilibili", "b23.tv"))
+    return any(marker in lowered for marker in ("b站", "bilibili", "b23.tv", "抖音", "douyin"))
