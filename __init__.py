@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="媒体阅读器",
     module_name="nekro_plugin_media",
     description="处理 OneBot 音视频与 Bilibili / 抖音分享链接，按需调用 Nekro 模型组提取媒体内容。",
-    version="1.3.0",
+    version="1.4.0",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_media",
     support_adapter=["onebot_v11"],
@@ -50,6 +50,24 @@ class MediaConfig(ConfigBase):
     douyin_max_duration: int = Field(default=30, title="抖音最大时长（分钟）")
     douyin_desc_char_limit: int = Field(default=150, title="抖音文案截断长度")
     douyin_download_timeout: int = Field(default=180, title="抖音下载总超时（秒）")
+    douyin_api_provider: Literal["native", "dtk"] = Field(
+        default="native", title="抖音解析后端", description="native 使用内置分享页解析；dtk 使用可配置的 DTK 兼容 API。"
+    )
+    douyin_api_base_url: str = Field(
+        default="", title="抖音 API 地址", description="DTK API 根地址，例如 https://demo.douyin.wtf；留空时使用内置解析。"
+    )
+    douyin_api_key: str = Field(
+        default="",
+        title="抖音 API Key",
+        description="可选。自建或托管 DTK 服务的 X-API-Key。",
+        json_schema_extra={"is_secret": True},
+    )
+    douyin_api_demo_login: bool = Field(
+        default=False,
+        title="启用 DTK Demo 登录",
+        description="无 API Key 时通过服务的 /api/v1/auth/demo 登录，仅适用于明确支持该流程的测试服务。",
+    )
+    douyin_api_timeout: int = Field(default=45, title="抖音 API 超时（秒）")
     NAPCAT_TEMP_DIR: str = Field(default="/app/.config/QQ/NapCat/temp", title="NapCat 临时目录")
 
 

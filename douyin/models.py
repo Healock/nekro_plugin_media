@@ -206,6 +206,42 @@ class DouyinContext(BaseModel):
         return f"点赞 {self.digg_count} · 评论 {self.comment_count}"
 
     @classmethod
+    def from_dtk_data(cls, data: dict) -> "DouyinContext":
+        """映射 DTK API 的公开字段，不保留其额外响应数据。"""
+        media = data.get("media") if isinstance(data.get("media"), dict) else {}
+        video = media.get("video") if isinstance(media.get("video"), dict) else {}
+        images_raw = media.get("images")
+        image_urls: list[str] = []
+        if isinstance(images_raw, list):
+            for image in images_raw:
+                if isinstance(image, str) and image:
+                    image_urls.append(image)
+                elif isinstance(image, dict):
+                    urls = image.get("urls")
+                    candidate = image.get("url")
+                    if not candidate and isinstance(urls, list):
+                        candidate = next((url for url in urls if isinstance(url, str) and url), None)
+                    if isinstance(candidate, str) and candidate:
+                        image_urls.append(candidate)
+        stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+        author = data.get("author")
+        if isinstance(author, dict):
+            author = author.get("nickname") or author.get("name")
+        video_urls = video.get("urls")
+        video_url = video.get("url")
+        if not video_url and isinstance(video_urls, list):
+            video_url = next((url for url in video_urls if isinstance(url, str) and url), None)
+        return cls(
+            desc=str(data.get("description") or data.get("title") or ""),
+            author=str(author or "未知作者"),
+            duration=_to_seconds(data.get("duration_ms")),
+            video_url=str(video_url) if video_url else None,
+            image_urls=image_urls,
+            digg_count=_to_int(stats.get("digg_count")),
+            comment_count=_to_int(stats.get("comment_count")),
+        )
+
+    @classmethod
     def from_router_data(cls, router_data: dict) -> "DouyinContext | None":
         item = find_item(router_data)
         if item is None:

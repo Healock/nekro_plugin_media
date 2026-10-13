@@ -22,6 +22,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegme
 from ..download_kit import MediaDownloadError, run_with_retry
 from .api import DOUYIN_URL_REGEX, fetch_douyin_context, resolve_aweme_id
 from .downloader import auto_clean_temp_dir, find_cached_file, schedule_download
+from .dtk import fetch_dtk_context, is_dtk_enabled
 from .notify import notify_user, watch_download
 
 __all__ = [
@@ -82,6 +83,13 @@ async def _resolve_context(target_url: str) -> tuple[str, Any]:
 
     async def _operation() -> tuple[str, Any]:
         aweme_id = await resolve_aweme_id(target_url)
+        from .. import config
+
+        if is_dtk_enabled(config):
+            try:
+                return aweme_id, await fetch_dtk_context(target_url, config)
+            except MediaDownloadError as exc:
+                core.logger.warning(f"[Douyin] DTK 后端失败（{exc.kind.value}），回退内置解析")
         context = await fetch_douyin_context(aweme_id)
         return aweme_id, context
 
