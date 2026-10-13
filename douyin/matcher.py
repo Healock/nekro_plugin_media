@@ -19,10 +19,11 @@ from nekro_agent.api import core
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegment
 
-from ..download_kit import MediaDownloadError, run_with_retry
-from .api import DOUYIN_URL_REGEX, fetch_douyin_context, resolve_aweme_id
+from ..download_kit import MediaDownloadError
+from .api import DOUYIN_URL_REGEX
 from .downloader import auto_clean_temp_dir, find_cached_file, schedule_download
 from .notify import notify_user, watch_download
+from .resolver import resolve_context
 
 __all__ = [
     "douyin_interceptor",
@@ -30,11 +31,6 @@ __all__ = [
     "format_context",
     "process_message",
 ]
-
-# 解析阶段的有限重试策略（网络抖动/5xx），与下载层保持一致的上限。
-_RESOLVE_MAX_RETRIES = 2
-_RESOLVE_BACKOFF = (1.0, 3.0)
-
 
 def _segment_text(segment: MessageSegment) -> str:
     if segment.type == "text":
@@ -78,19 +74,8 @@ def format_context(context: object, config: object, aweme_id: str) -> str:
 
 
 async def _resolve_context(target_url: str) -> tuple[str, Any]:
-    """解析短链并抓取作品上下文；网络类失败按固定上限重试。"""
-
-    async def _operation() -> tuple[str, Any]:
-        aweme_id = await resolve_aweme_id(target_url)
-        context = await fetch_douyin_context(aweme_id)
-        return aweme_id, context
-
-    def _on_retry(exc: MediaDownloadError, attempt: int, delay: float) -> None:
-        core.logger.warning(f"[Douyin] 解析第 {attempt} 次重试（{delay:.0f}s 后）：{exc.detail}")
-
-    return await run_with_retry(
-        _operation, max_retries=_RESOLVE_MAX_RETRIES, backoff=_RESOLVE_BACKOFF, on_retry=_on_retry
-    )
+    from .. import config
+    return await resolve_context(target_url, config)
 
 
 async def process_message(
