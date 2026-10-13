@@ -58,6 +58,11 @@ nekro_plugin_media/
   `X-API-Key`；测试服务若支持公开 Demo 登录，可开启 `douyin_api_demo_login`。DTK 请求失败会回退内置分享页解析。
   公共 demo 仅适合测试，不建议作为生产服务。DTK 返回的媒体 URL 按不可信输入处理：仅接受 HTTP(S)，并拒绝
   localhost、私有/保留 IP 及解析到非公网地址的主机。DTK 不提供带水印直链时，下载链为无水印直链后回退 yt-dlp。
+- 可选 `ucmao/media-parser` 后端：将 `douyin_api_provider` 设为 `media_parser`，并把
+  `douyin_api_base_url` 指向自托管服务（例如 `http://media-parser:8051`）。该服务的
+  `/api/v1/parse` 响应会被适配为插件内部格式。普通抖音视频和普通图文通常无需 Cookie；
+  LivePhoto、放映厅长片或触发平台风控时，按该项目文档配置服务端的 `DOUYIN_COOKIE`。
+  `API_ONLY=true` 会关闭鉴权，因此该服务必须只在受信任的容器内网开放，不能映射到公网端口。
 - 直链下载失败时，回退到 `yt-dlp`（复用与 Bilibili 相同的动态依赖）。首次下载完成并通过校验前，插件不会
   把本地视频段交给媒体分析流程；下载失败则保留原消息并发送失败提示，避免分析尚不存在的占位文件。
 
@@ -102,12 +107,22 @@ Bilibili 与抖音下载链路（以及共用的 `download_kit.py`）遵循以�
 | `douyin_max_duration` | `30` | 抖音视频最大时长，单位为分钟 |
 | `douyin_desc_char_limit` | `150` | 抖音文案截断长度 |
 | `douyin_download_timeout` | `180` | 抖音下载总超时，单位为秒 |
-| `douyin_api_provider` | `native` | 抖音解析后端：`native` 或 `dtk` |
-| `douyin_api_base_url` | 空 | DTK API 根地址，例如 `https://demo.douyin.wtf` |
-| `douyin_api_key` | 空 | DTK 服务的可选 `X-API-Key` |
+| `douyin_api_provider` | `native` | 抖音解析后端：`native`、`dtk` 或 `media_parser` |
+| `douyin_api_base_url` | 空 | API 根地址；`media_parser` 例如 `http://media-parser:8051` |
+| `douyin_api_key` | 空 | API 服务的可选 `X-API-Key` |
 | `douyin_api_demo_login` | `false` | 是否使用 DTK 服务的 `/api/v1/auth/demo` 测试登录 |
 | `douyin_api_timeout` | `45` | DTK API 请求超时，单位为秒 |
 | `NAPCAT_TEMP_DIR` | `/app/.config/QQ/NapCat/temp` | NapCat 临时文件目录 |
+
+选择 `media_parser` 时，建议在 Media 插件配置中设置：
+
+```text
+douyin_api_provider = media_parser
+douyin_api_base_url = http://media-parser:8051
+douyin_api_key = 留空（仅当自建服务启用了鉴权时填写）
+```
+
+其中 `media-parser` 必须是 NekroAgent 容器能够解析到的服务名或内网地址。解析失败时仍会回退到插件内置解析。
 
 ## 外部依赖
 
