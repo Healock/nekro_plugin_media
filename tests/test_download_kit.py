@@ -414,3 +414,72 @@ def test_download_manager_cancel_all_force_cancels_after_grace() -> None:
         assert manager.get("k") is None
 
     asyncio.run(scenario())
+
+
+def test_download_manager_stale_callback_keeps_new_task_event() -> None:
+    """旧任务的迟到完成回调不得误删同 key 新任务刚登记的取消信号。
+
+    复现窗口：任务的 asyncio Task ``done()`` 后，其完成回调经 ``call_soon`` 延后执行；而
+    ``InflightRegistry.get`` 在 ``task.done()`` 时即让出该 key，允许同一 key 立刻新建任务。
+    此时旧回调若无差别 ``pop(key)``，会删掉新任务的 Event，导致其无法再被 ``cancel_all`` 取消。
+    """
+    async def scenario() -> None:
+        manager = kit.DownloadManager("test")
+        events: list[threading.Event] = []
+
+        async def quick(event: threading.Event) -> None:
+            events.append(event)
+
+        first = manager.schedule("k", quick)
+        await asyncio.sleep(0)  # first 完成；其完成回调已排队但尚未执行
+        assert first.done()
+        assert manager.get("k") is None  # get 见 done 即让出 key
+
+        second = manager.schedule("k", quick)  # 在旧回调执行前登记新任务
+        new_event = manager.event("k")
+        assert new_event is not None
+        assert new_event is not events[0]  # 新任务拿到全新 Event
+
+        await asyncio.sleep(0)  # 触发旧任务的迟到回调
+        assert manager.event("k") is new_event, "旧任务的迟到回调不得删除新任务的取消信号"
+
+        # 新任务仍能被独立取消（其取消信号未被旧回调破坏）。
+        await manager.cancel_all(grace=1.0)
+        assert new_event.is_set()
+        assert second.done()
+
+    asyncio.run(scenario())
+
+
+def test_download_manager_new_same_key_task_cancellable_after_grace_timeout() -> None:
+    """grace 超时强制取消旧任务（worker 仍存活）后，同 key 新任务仍可被独立取消。"""
+    async def scenario() -> None:
+        manager = kit.DownloadManager("test")
+        old_started = asyncio.Event()
+
+        async def stubborn(_event: threading.Event) -> None:
+            old_started.set()
+            await asyncio.sleep(30)  # 忽略取消，超过 grace
+
+        old = manager.schedule("k", stubborn)
+        await old_started.wait()
+        await asyncio.wait_for(manager.cancel_all(grace=0.05), timeout=2.0)
+        assert old.cancelled()
+        assert manager.get("k") is None
+
+        new_started = asyncio.Event()
+        seen: dict[str, bool] = {}
+
+        async def cooperative(event: threading.Event) -> None:
+            new_started.set()
+            while not event.is_set():
+                await asyncio.sleep(0.005)
+            seen["cancelled"] = True
+
+        new = manager.schedule("k", cooperative)
+        await new_started.wait()
+        await asyncio.wait_for(manager.cancel_all(grace=1.0), timeout=2.0)
+        assert seen.get("cancelled") is True, "同 key 新任务应仍能被独立取消"
+        assert new.done()
+
+    asyncio.run(scenario())

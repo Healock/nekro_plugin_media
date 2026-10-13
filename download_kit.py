@@ -364,9 +364,6 @@ class InflightRegistry:
     def tasks(self) -> tuple[asyncio.Task[Any], ...]:
         return tuple(self._tasks.values())
 
-    def clear(self) -> None:
-        self._tasks.clear()
-
     def _release(self, key: str, task: asyncio.Task[Any]) -> None:
         if self._tasks.get(key) is task:
             self._tasks.pop(key, None)
@@ -385,6 +382,13 @@ class DownloadManager:
 
     如此可避免“取消后立即清空登记、放开同 id 重登”导致的“旧 worker 未退 + 同 id 新任务”
     并存：只要 worker 在有界时间内退出，登记就在其退出后才释放。
+
+    登记与取消信号的清理**只由各任务自己的完成回调按身份执行**（``_forget`` 校验 Event 身份、
+    ``InflightRegistry._release`` 校验 Task 身份），``cancel_all`` 不做整表清空。因为任务
+    ``done()`` 后 ``InflightRegistry.get`` 即让出 key，其完成回调可能**晚于**同一 key 新任务的
+    登记执行；按身份清理可确保迟到回调不会误删新任务的取消信号，使新任务仍可被独立取消。
+    仍未消除的边界：grace 超时后底层 worker 线程可能短暂存活（线程无法强杀），但已在超时前
+    收到取消信号、不会发布产物；此时同 key 新任务与旧 worker 可能短时并存。
     """
 
     def __init__(self, name: str = "") -> None:
@@ -414,7 +418,7 @@ class DownloadManager:
         self._events[key] = event
         task = asyncio.create_task(factory(event), name=f"{self._name}-{key}" if self._name else key)
         self._registry.register(key, task)
-        task.add_done_callback(lambda _finished, _key=key: self._forget(_key))
+        task.add_done_callback(lambda _finished, _key=key, _event=event: self._forget(_key, _event))
         return task
 
     def tasks(self) -> tuple[asyncio.Task[Any], ...]:
@@ -425,6 +429,9 @@ class DownloadManager:
 
         ``grace`` 为等待 worker 退出的上限秒数；到点仍未结束的任务会被强制取消协程
         （线程本身无法强杀，但其已收到取消信号、会在下次机会自行收敛）。
+
+        收尾仅依赖各任务自己的完成回调释放登记，**不做整表清空**：整表清空会误删在等待期间
+        为同一 key 新登记的任务的取消信号/登记（任务 ``done()`` 后其回调可能晚于新任务登记执行）。
         """
         tasks = self._registry.tasks()
         for event in tuple(self._events.values()):
@@ -435,9 +442,10 @@ class DownloadManager:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-        self._events.clear()
-        self._registry.clear()
 
-    def _forget(self, key: str) -> None:
-        # 完成回调与 InflightRegistry 的释放回调同批执行、互不穿插，故此处按 key 清除信号即可。
-        self._events.pop(key, None)
+    def _forget(self, key: str, event: threading.Event) -> None:
+        # 仅当该 key 当前登记的仍是本任务的 Event 时才清理：任务 ``done()`` 后其完成回调可能
+        # 晚于「同 key 新任务登记」执行（``InflightRegistry.get`` 在 ``task.done()`` 时即让出 key），
+        # 无差别 ``pop`` 会误删新任务刚登记的取消信号，导致其此后无法被 ``cancel_all`` 取消。
+        if self._events.get(key) is event:
+            self._events.pop(key, None)

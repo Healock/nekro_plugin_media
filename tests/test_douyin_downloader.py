@@ -344,6 +344,9 @@ def test_cancel_all_waits_for_worker_before_releasing_registry(
         release.wait(timeout=5.0)
 
     monkeypatch.setattr(downloader, "_download_with_ytdlp", blocking_ytdlp)
+    # 夹具只写 ftyp 头；固定校验器为 no-op，避免依赖真实 ffprobe 是否安装（否则“第二次下载发布”
+    # 会因 ffprobe 判定非完整 mp4 而随机失败）。
+    monkeypatch.setattr(downloader, "_verify_output", lambda _path: None)
 
     async def scenario() -> None:
         out = tmp_path / "11.mp4"
