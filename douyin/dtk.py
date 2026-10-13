@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
+import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -29,6 +33,29 @@ async def _json(response: aiohttp.ClientResponse) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise MediaDownloadError(FailureKind.PARSE, "抖音 API 返回了无效响应")
     return payload
+
+
+def _failure_kind_for_response(status: int, payload: dict[str, Any]) -> FailureKind | None:
+    if status in {401, 403}:
+        return FailureKind.AUTH
+    if status >= 500:
+        return FailureKind.SERVER
+    if status >= 400:
+        return FailureKind.PARSE
+    if payload.get("success"):
+        return None
+    error = payload.get("error")
+    code = error.get("code") if isinstance(error, dict) else "UNKNOWN"
+    return FailureKind.AUTH if code in {"UNAUTHENTICATED", "FORBIDDEN"} else FailureKind.PARSE
+
+
+def _raise_for_response(status: int, payload: dict[str, Any]) -> None:
+    kind = _failure_kind_for_response(status, payload)
+    if kind is None:
+        return
+    error = payload.get("error")
+    code = error.get("code") if isinstance(error, dict) else f"HTTP_{status}"
+    raise MediaDownloadError(kind, f"抖音 API 解析失败（{code}）")
 
 
 async def _login_demo(session: aiohttp.ClientSession, base_url: str) -> None:
@@ -61,7 +88,10 @@ async def fetch_dtk_context(target_url: str, config: object) -> DouyinContext:
     timeout_seconds = max(1, int(getattr(config, "douyin_api_timeout", 45) or 45))
     headers = _api_headers(config)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
+    # unsafe 仅用于兼容测试服务在本地/非标准域名下发放的会话 Cookie；不放宽媒体 URL 校验。
+    async with aiohttp.ClientSession(
+        headers=headers, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True)
+    ) as session:
         if not headers and bool(getattr(config, "douyin_api_demo_login", False)):
             await _login_demo(session, base_url)
         try:
@@ -70,22 +100,44 @@ async def fetch_dtk_context(target_url: str, config: object) -> DouyinContext:
             async with session.post(
                 f"{base_url}/api/v1/parse?wait={wait_seconds}", json={"url": target_url}
             ) as response:
-                payload = await _json(response)
+                try:
+                    payload = await _json(response)
+                except MediaDownloadError:
+                    kind = _failure_kind_for_response(response.status, {})
+                    if kind is None:
+                        raise
+                    raise MediaDownloadError(kind, f"抖音 API 解析失败（HTTP_{response.status}）") from None
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             raise translate_network_error(exc) from exc
-        if not payload.get("success"):
-            error = payload.get("error")
-            code = error.get("code") if isinstance(error, dict) else "UNKNOWN"
-            kind = (
-                FailureKind.AUTH
-                if code in {"UNAUTHENTICATED", "FORBIDDEN"}
-                else FailureKind.PARSE
-            )
-            raise MediaDownloadError(kind, f"抖音 API 解析失败（{code}）")
+        _raise_for_response(response.status, payload)
         data = payload.get("data")
         if not isinstance(data, dict):
             raise MediaDownloadError(FailureKind.PARSE, "抖音 API 未返回作品数据")
-        return DouyinContext.from_dtk_data(data)
+        context = DouyinContext.from_dtk_data(data)
+        await _validate_public_media_hosts(context)
+        return context
+
+
+async def _validate_public_media_hosts(context: DouyinContext) -> None:
+    """拒绝解析到非公网 IP 的媒体主机，缩小外部 API 引入的 SSRF 风险。"""
+    urls = [context.video_url, *context.image_urls]
+    hosts: set[tuple[str, int]] = set()
+    for url in urls:
+        if not url:
+            continue
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        if not host:
+            raise MediaDownloadError(FailureKind.PARSE, "抖音 API 返回了无效媒体地址")
+        hosts.add((host, parsed.port or (443 if parsed.scheme == "https" else 80)))
+    loop = asyncio.get_running_loop()
+    for host, port in hosts:
+        try:
+            records = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except (OSError, ValueError) as exc:
+            raise MediaDownloadError(FailureKind.NETWORK, "无法解析抖音媒体服务器地址") from exc
+        if not records or any(not ipaddress.ip_address(record[4][0]).is_global for record in records):
+            raise MediaDownloadError(FailureKind.PARSE, "抖音 API 返回了非公网媒体地址")
 
 
 def is_dtk_enabled(config: object) -> bool:

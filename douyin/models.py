@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -176,6 +178,32 @@ def truncate_text(text: str, limit: int) -> str:
     return text
 
 
+def is_safe_media_url(value: object) -> bool:
+    """仅接受可供媒体客户端访问的公开 HTTP(S) 地址。
+
+    DTK 返回的地址来自插件配置的外部服务，不能默认继承内置抖音解析的信任边界。
+    这里拒绝本地/保留 IP、localhost 和本地域名；域名解析后的访问仍由部署网络策略控制。
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not host or parsed.username or parsed.password:
+        return False
+    host = host.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return address.is_global
+
+
 class DouyinContext(BaseModel):
     """从分享页解析出的抖音作品上下文。"""
 
@@ -197,7 +225,7 @@ class DouyinContext(BaseModel):
     @property
     def is_gallery(self) -> bool:
         """图文帖（笔记）判定：存在图片即视为图集。"""
-        return bool(self.image_urls)
+        return bool(self.image_urls) and not bool(self.video_url)
 
     def title(self, limit: int = 150) -> str:
         return truncate_text(self.desc.strip() or "无标题", limit)
@@ -214,14 +242,14 @@ class DouyinContext(BaseModel):
         image_urls: list[str] = []
         if isinstance(images_raw, list):
             for image in images_raw:
-                if isinstance(image, str) and image:
+                if is_safe_media_url(image):
                     image_urls.append(image)
                 elif isinstance(image, dict):
                     urls = image.get("urls")
                     candidate = image.get("url")
                     if not candidate and isinstance(urls, list):
                         candidate = next((url for url in urls if isinstance(url, str) and url), None)
-                    if isinstance(candidate, str) and candidate:
+                    if is_safe_media_url(candidate):
                         image_urls.append(candidate)
         stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
         author = data.get("author")
@@ -229,8 +257,10 @@ class DouyinContext(BaseModel):
             author = author.get("nickname") or author.get("name")
         video_urls = video.get("urls")
         video_url = video.get("url")
+        if not is_safe_media_url(video_url):
+            video_url = None
         if not video_url and isinstance(video_urls, list):
-            video_url = next((url for url in video_urls if isinstance(url, str) and url), None)
+            video_url = next((url for url in video_urls if is_safe_media_url(url)), None)
         return cls(
             desc=str(data.get("description") or data.get("title") or ""),
             author=str(author or "未知作者"),

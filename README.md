@@ -56,7 +56,8 @@ nekro_plugin_media/
   不写入日志、聊天历史或上下文序列化。若数据目录存在 `douyin_cookies.txt`，`yt-dlp` 优先使用该文件。
 - 可选 DTK API 后端：将 `douyin_api_provider` 设为 `dtk` 并填写 `douyin_api_base_url`。配置 API Key 时使用
   `X-API-Key`；测试服务若支持公开 Demo 登录，可开启 `douyin_api_demo_login`。DTK 请求失败会回退内置分享页解析。
-  公共 demo 仅适合测试，不建议作为生产服务，也不要把其账号、Cookie 或签名媒体 URL 写入日志。
+  公共 demo 仅适合测试，不建议作为生产服务。DTK 返回的媒体 URL 按不可信输入处理：仅接受 HTTP(S)，并拒绝
+  localhost、私有/保留 IP 及解析到非公网地址的主机。DTK 不提供带水印直链时，下载链为无水印直链后回退 yt-dlp。
 - 直链下载失败时，回退到 `yt-dlp`（复用与 Bilibili 相同的动态依赖）。首次下载完成并通过校验前，插件不会
   把本地视频段交给媒体分析流程；下载失败则保留原消息并发送失败提示，避免分析尚不存在的占位文件。
 
