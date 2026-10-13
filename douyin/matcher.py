@@ -24,6 +24,7 @@ from .api import DOUYIN_URL_REGEX
 from .downloader import auto_clean_temp_dir, find_cached_file, schedule_download
 from .notify import notify_user, watch_download
 from .resolver import resolve_context
+from ..matcher_registration import ensure_matcher
 
 __all__ = [
     "douyin_interceptor",
@@ -164,3 +165,12 @@ async def handle_douyin_penetration(bot: Bot, event: MessageEvent) -> None:
     from .. import config, plugin
 
     await process_message(event, config, plugin.get_plugin_data_dir(), bot=bot)
+
+
+def register_matcher() -> None:
+    global douyin_interceptor
+    douyin_interceptor = ensure_matcher(douyin_interceptor, on_message, handle_douyin_penetration, priority=9)
+
+
+douyin_interceptor: Any | None = None
+register_matcher()

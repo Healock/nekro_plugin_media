@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
+from typing import Any
 
 from nekro_agent.api import core
 from nonebot import on_message
@@ -10,6 +11,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegme
 
 from .api import BILI_REGEX, fetch_bilibili_context, resolve_bvid
 from .downloader import auto_clean_temp_dir, find_cached_file, schedule_download
+from ..matcher_registration import ensure_matcher
 
 
 def _segment_text(segment: MessageSegment) -> str:
@@ -81,12 +83,19 @@ async def process_message(event: MessageEvent, config: object, data_dir: Path) -
         event.message.extend(replacement)
 
 
-bili_interceptor = on_message(priority=9, block=False)
+bili_interceptor: Any | None = None
 
 
-@bili_interceptor.handle()
 async def handle_bili_penetration(bot: Bot, event: MessageEvent) -> None:
     del bot
     from .. import config, plugin
 
     await process_message(event, config, plugin.get_plugin_data_dir())
+
+
+def register_matcher() -> None:
+    global bili_interceptor
+    bili_interceptor = ensure_matcher(bili_interceptor, on_message, handle_bili_penetration, priority=9)
+
+
+register_matcher()

@@ -4,10 +4,21 @@ import asyncio
 import os
 
 from . import MEDIA_CACHE, background_tasks, generated_temp_files, plugin
+from . import matcher as media_matcher
+from .bilibili import matcher as bilibili_matcher
+from .douyin import matcher as douyin_matcher
 from .bilibili.registration import cleanup as cleanup_bilibili
 from .douyin.registration import cleanup as cleanup_douyin
-from .matcher import media_interceptor
 from .matcher_cleanup import destroy_matcher
+
+
+@plugin.mount_init_method()
+async def initialize_matchers() -> None:
+    """Recreate matchers after a plugin hot reload destroyed old instances."""
+
+    bilibili_matcher.register_matcher()
+    douyin_matcher.register_matcher()
+    media_matcher.register_matcher()
 
 
 @plugin.mount_cleanup_method()
@@ -27,4 +38,5 @@ async def cleanup() -> None:
             continue
     generated_temp_files.clear()
     MEDIA_CACHE.clear()
-    destroy_matcher(media_interceptor)
+    destroy_matcher(media_matcher.media_interceptor)
+    media_matcher.media_interceptor = None

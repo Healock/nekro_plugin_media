@@ -10,15 +10,16 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegme
 from nekro_agent.api import core
 
 from . import MEDIA_CACHE, MediaConfig, plugin
+from .debounce_bridge import publish_media_hint
 from .locator import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, extract_media_info
+from .matcher_registration import ensure_matcher
 from .model_config import has_model_config
 from .types import MediaCacheEntry, MediaStatus
 
 
-media_interceptor = on_message(priority=10, block=False)
+media_interceptor: Any | None = None
 
 
-@media_interceptor.handle()
 async def handle_media_message(bot: Bot, event: MessageEvent) -> None:
     config = plugin.get_config(MediaConfig)
     if not has_model_config(config):
@@ -42,6 +43,7 @@ async def handle_media_message(bot: Bot, event: MessageEvent) -> None:
         bot_id=bot.self_id,
         status=MediaStatus.PENDING,
     )
+    publish_media_hint(event, media_id, media_info["type"])
     type_name = "视频" if media_info["type"] == "video" else "语音"
     notice = (
         f"【本地{type_name}挂载成功｜句柄 ID：{media_id}】\n"
@@ -51,6 +53,14 @@ async def handle_media_message(bot: Bot, event: MessageEvent) -> None:
         notice += f"\n【上下文】\n{context_text}"
     _replace_target(event, notice)
     core.logger.success(f"[Media] 媒体句柄已创建：{media_id}")
+
+
+def register_matcher() -> None:
+    global media_interceptor
+    media_interceptor = ensure_matcher(media_interceptor, on_message, handle_media_message, priority=10)
+
+
+register_matcher()
 
 
 def _normalize_file_segments(message: Message) -> None:
