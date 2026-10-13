@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -218,5 +220,197 @@ def test_inflight_registry_drops_finished_task_on_get() -> None:
         registry.register("k", task)  # 登记一个已完成任务
         assert registry.get("k") is None
         assert registry.tasks() == ()
+
+    asyncio.run(scenario())
+
+
+# --- 暂存执行器：唯一目录 + 校验后原子发布 + 失败/取消清理 --------------------------
+
+
+def test_staging_dir_is_unique_and_prefixed(tmp_path: Path) -> None:
+    first = kit.staging_dir(tmp_path, "id")
+    second = kit.staging_dir(tmp_path, "id")
+    assert first != second
+    assert first.parent == tmp_path
+    assert first.name.startswith(".ytdlp-id-")
+
+
+def test_locate_staged_media_ignores_partials(tmp_path: Path) -> None:
+    (tmp_path / "x.mp4.part").write_bytes(b"half")
+    (tmp_path / "x.ytdl").write_bytes(b"frag")
+    assert kit.locate_staged_media(tmp_path) is None
+    (tmp_path / "x.mp4").write_bytes(_FTYP_HEADER)
+    found = kit.locate_staged_media(tmp_path)
+    assert found is not None
+    assert found.name == "x.mp4"
+
+
+def test_run_staged_download_publishes_and_cleans(tmp_path: Path) -> None:
+    out = tmp_path / "out.mp4"
+
+    def produce(work_dir: Path, _event: threading.Event) -> None:
+        work_dir.joinpath("out.mp4").write_bytes(_FTYP_HEADER)
+
+    published = kit.run_staged_download(
+        tmp_path, out, "k", produce, threading.Event(), verify=kit.ensure_complete_mp4
+    )
+    assert published is True
+    assert out.read_bytes() == _FTYP_HEADER
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_run_staged_download_cleans_on_failure(tmp_path: Path) -> None:
+    out = tmp_path / "out.mp4"
+
+    def produce(work_dir: Path, _event: threading.Event) -> None:
+        work_dir.joinpath("out.mp4").write_bytes(_FTYP_HEADER)  # 半成品
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        kit.run_staged_download(tmp_path, out, "k", produce, threading.Event(), verify=kit.ensure_complete_mp4)
+    assert not out.exists()
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_run_staged_download_skips_publish_when_cancelled(tmp_path: Path) -> None:
+    out = tmp_path / "out.mp4"
+    event = threading.Event()
+
+    def produce(work_dir: Path, ev: threading.Event) -> None:
+        work_dir.joinpath("out.mp4").write_bytes(_FTYP_HEADER)
+        ev.set()  # 下载完成后、发布前发生取消
+
+    published = kit.run_staged_download(tmp_path, out, "k", produce, event, verify=kit.ensure_complete_mp4)
+    assert published is False
+    assert not out.exists()
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_run_staged_download_discards_when_verify_fails(tmp_path: Path) -> None:
+    out = tmp_path / "out.mp4"
+
+    def produce(work_dir: Path, _event: threading.Event) -> None:
+        work_dir.joinpath("out.mp4").write_bytes(_FTYP_HEADER)
+
+    def reject(_path: Path) -> None:
+        raise kit.MediaDownloadError(kit.FailureKind.INVALID, "bad")
+
+    with pytest.raises(kit.MediaDownloadError) as excinfo:
+        kit.run_staged_download(tmp_path, out, "k", produce, threading.Event(), verify=reject)
+    assert excinfo.value.kind is kit.FailureKind.INVALID
+    assert not out.exists()
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_run_staged_download_raises_invalid_when_no_media(tmp_path: Path) -> None:
+    out = tmp_path / "out.mp4"
+
+    def produce(_work_dir: Path, _event: threading.Event) -> None:
+        return None  # 未产出任何文件
+
+    with pytest.raises(kit.MediaDownloadError) as excinfo:
+        kit.run_staged_download(tmp_path, out, "k", produce, threading.Event(), verify=kit.ensure_complete_mp4)
+    assert excinfo.value.kind is kit.FailureKind.INVALID
+    assert list(tmp_path.glob(".ytdlp-*")) == []
+
+
+def test_clean_stale_staging_removes_only_old_staging_dirs(tmp_path: Path) -> None:
+    stale = tmp_path / ".ytdlp-old-abcd"
+    stale.mkdir()
+    fresh = tmp_path / ".ytdlp-new-efgh"
+    fresh.mkdir()
+    keep = tmp_path / "important.mp4"
+    keep.write_bytes(_FTYP_HEADER)
+    stale.touch()
+    import os
+
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+    kit.clean_stale_staging(tmp_path, time.time() - 1800)  # 截止 30 分钟前
+    assert not stale.exists()  # 1 小时前的暂存目录被清理
+    assert fresh.exists()      # 新建的暂存目录保留
+    assert keep.exists()       # 只清理暂存目录，不动成品文件
+
+
+# --- 有限重试：取消短路 -------------------------------------------------------------
+
+
+def test_run_with_retry_short_circuits_when_should_stop() -> None:
+    calls = {"n": 0}
+
+    async def operation() -> str:
+        calls["n"] += 1
+        raise kit.MediaDownloadError(kit.FailureKind.NETWORK, "boom")
+
+    with pytest.raises(kit.MediaDownloadError):
+        asyncio.run(
+            kit.run_with_retry(operation, max_retries=5, backoff=(0.0,), should_stop=lambda: True)
+        )
+    assert calls["n"] == 1  # should_stop 为真时不再重试
+
+
+# --- 下载管理器：并发去重 + 取消有界等待 --------------------------------------------
+
+
+def test_download_manager_reuses_inflight_and_clears_event_on_done() -> None:
+    async def scenario() -> None:
+        manager = kit.DownloadManager("test")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def job(_event: threading.Event) -> None:
+            started.set()
+            await release.wait()
+
+        first = manager.schedule("k", job)
+        await started.wait()
+        assert manager.get("k") is first
+        assert manager.event("k") is not None
+        assert manager.schedule("k", job) is first  # 进行中复用
+        release.set()
+        await first
+        await asyncio.sleep(0)
+        assert manager.get("k") is None
+        assert manager.event("k") is None  # 结束后信号被清理
+
+    asyncio.run(scenario())
+
+
+def test_download_manager_cancel_all_waits_for_cooperative_exit() -> None:
+    async def scenario() -> None:
+        manager = kit.DownloadManager("test")
+        started = asyncio.Event()
+        seen: dict[str, bool] = {}
+
+        async def job(event: threading.Event) -> None:
+            started.set()
+            while not event.is_set():
+                await asyncio.sleep(0.005)
+            seen["event"] = True  # 观察到取消信号后自行退出
+
+        task = manager.schedule("k", job)
+        await started.wait()
+        await manager.cancel_all(grace=2.0)
+        assert seen.get("event") is True
+        assert task.done()
+        assert manager.get("k") is None
+
+    asyncio.run(scenario())
+
+
+def test_download_manager_cancel_all_force_cancels_after_grace() -> None:
+    async def scenario() -> None:
+        manager = kit.DownloadManager("test")
+        started = asyncio.Event()
+
+        async def stubborn(_event: threading.Event) -> None:
+            started.set()
+            await asyncio.sleep(30)  # 忽略取消信号，模拟无进度回调的长阻塞
+
+        task = manager.schedule("k", stubborn)
+        await started.wait()
+        await asyncio.wait_for(manager.cancel_all(grace=0.05), timeout=2.0)
+        assert task.cancelled()  # 到达有界上限后强制取消
+        assert manager.get("k") is None
 
     asyncio.run(scenario())

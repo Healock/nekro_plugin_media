@@ -140,7 +140,7 @@ def test_download_propagates_permanent_failure(monkeypatch: pytest.MonkeyPatch, 
     async def scenario() -> None:
         with pytest.raises(kit.MediaDownloadError):
             await downloader._download(
-                "42", tmp_path / "42.mp4", "https://v/nowm", "https://v/wm", "720p", tmp_path
+                "42", tmp_path / "42.mp4", "https://v/nowm", "https://v/wm", "720p", tmp_path, threading.Event()
             )
         assert calls["n"] == 1  # 永久失败既不重试也不降级
 
@@ -165,7 +165,9 @@ def test_download_falls_back_to_watermark_tier(monkeypatch: pytest.MonkeyPatch, 
 
     async def scenario() -> None:
         out = tmp_path / "7.mp4"
-        await downloader._download("7", out, "https://v/play", "https://v/playwm", "720p", tmp_path)
+        await downloader._download(
+            "7", out, "https://v/play", "https://v/playwm", "720p", tmp_path, threading.Event()
+        )
         assert out.exists()
 
     asyncio.run(scenario())
@@ -182,8 +184,8 @@ def _write_staged(out_tmpl: str, aweme_id: str, payload: bytes) -> Path:
 
 def test_ytdlp_staging_dir_is_unique() -> None:
     base = Path("/tmp/nekro-douyin-test")
-    first = downloader._staging_dir(base, "123")
-    second = downloader._staging_dir(base, "123")
+    first = kit.staging_dir(base, "123")
+    second = kit.staging_dir(base, "123")
     assert first != second
     assert first.parent == base
     assert first.name.startswith(".ytdlp-123-")
@@ -205,7 +207,7 @@ def test_ytdlp_success_publishes_staged_output_and_removes_staging_dir(
 
     async def scenario() -> None:
         out = tmp_path / "5.mp4"
-        await downloader._download("5", out, None, None, "720p", tmp_path)
+        await downloader._download("5", out, None, None, "720p", tmp_path, threading.Event())
         assert out.read_bytes() == _FTYP_HEADER  # 校验通过后原子发布到成品路径
 
     asyncio.run(scenario())
@@ -231,7 +233,7 @@ def test_ytdlp_failure_leaves_no_output_and_cleans_staging(
     async def scenario() -> None:
         out = tmp_path / "6.mp4"
         with pytest.raises(kit.MediaDownloadError):
-            await downloader._download("6", out, None, None, "720p", tmp_path)
+            await downloader._download("6", out, None, None, "720p", tmp_path, threading.Event())
         # 失败档位绝不把中间产物留在 output_path 上，也不留临时目录。
         assert not out.exists()
         assert downloader.find_cached_file(tmp_path, "6") is None
@@ -257,7 +259,7 @@ def test_ytdlp_verify_failure_discards_staged_without_publishing(
     async def scenario() -> None:
         out = tmp_path / "7.mp4"
         with pytest.raises(kit.MediaDownloadError):
-            await downloader._download("7", out, None, None, "720p", tmp_path)
+            await downloader._download("7", out, None, None, "720p", tmp_path, threading.Event())
         assert not out.exists()
         assert downloader.find_cached_file(tmp_path, "7") is None
 
@@ -292,8 +294,9 @@ def test_cancel_while_worker_running_defers_cleanup_to_worker(
 
     async def scenario() -> None:
         out = tmp_path / "8.mp4"
+        cancel_event = threading.Event()
         task = asyncio.create_task(
-            downloader._download_guarded("8", out, None, None, "720p", tmp_path, 30.0)
+            downloader._download_guarded("8", out, None, None, "720p", tmp_path, 30.0, cancel_event)
         )
         for _ in range(500):
             if started.is_set():
@@ -307,6 +310,7 @@ def test_cancel_while_worker_running_defers_cleanup_to_worker(
             await task
         # 取消后 worker 仍在运行：取消方不得抢先删除它仍在使用的暂存目录。
         assert list(tmp_path.glob(".ytdlp-*")), "取消方不得与 worker 并发清理暂存目录"
+        assert cancel_event.is_set(), "取消路径应置位协作式取消信号"
 
         release.set()  # 放行 worker，交由它自行收尾
         for _ in range(500):
@@ -318,3 +322,53 @@ def test_cancel_while_worker_running_defers_cleanup_to_worker(
         assert observed.get("cancel_set") is True, "worker 应观察到协作式取消信号"
 
     asyncio.run(scenario())
+
+
+def test_cancel_all_waits_for_worker_before_releasing_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """取消后应等 worker 真正退出再释放登记，避免“旧 worker 未退 + 同 id 新任务”的重复下载。
+
+    模拟“无进度回调的长阻塞”：worker 不响应取消信号直到被放行。断言 ``cancel_download_tasks``
+    在 worker 退出前**不返回**、登记**不释放**；worker 退出后才释放，且同 id 重新调度得到全新任务。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_ytdlp(
+        aweme_id: str, out_tmpl: str, _format_str: str, _data_dir: Path, _cancel_event: threading.Event
+    ) -> None:
+        Path(out_tmpl).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_tmpl).parent.joinpath(f"{aweme_id}.mp4").write_bytes(_FTYP_HEADER)
+        started.set()
+        release.wait(timeout=5.0)
+
+    monkeypatch.setattr(downloader, "_download_with_ytdlp", blocking_ytdlp)
+
+    async def scenario() -> None:
+        out = tmp_path / "11.mp4"
+        task = downloader.schedule_download("11", out, None, "720p", tmp_path)
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "worker 线程应已进入阻塞"
+
+        cancelling = asyncio.create_task(downloader.cancel_download_tasks())
+        await asyncio.sleep(0.05)
+        # worker 尚未退出：cancel_all 仍在等待，登记未释放，尚不允许同 id 重登。
+        assert not cancelling.done(), "cancel_all 应等待 worker 退出后才返回"
+        assert downloader._DOWNLOADS.get("11") is task, "worker 未退出前不得释放登记"
+
+        release.set()  # 放行 worker
+        await asyncio.wait_for(cancelling, timeout=5.0)
+        assert downloader._DOWNLOADS.get("11") is None, "worker 退出后应释放登记"
+        assert not out.exists(), "取消后不得发布成品"
+
+        # 登记释放后同 id 重新调度得到全新任务（旧任务已结束，不会与新任务并存重复下载）。
+        again = downloader.schedule_download("11", out, None, "720p", tmp_path)
+        assert again is not task
+        await asyncio.wait_for(again, timeout=5.0)
+
+    asyncio.run(scenario())
+    assert list(tmp_path.glob(".ytdlp-*")) == []
