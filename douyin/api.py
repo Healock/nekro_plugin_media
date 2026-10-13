@@ -197,6 +197,9 @@ async def _try_share_pages(
             continue
         context = DouyinContext.from_router_data(router_data)
         if context is not None:
+            # 分享页能解析出来，说明本次请求使用的 ttwid 可继续用于视频流下载。
+            # 只挂在内存上下文上，DouyinContext 已将该字段排除出序列化。
+            context.download_cookie = cookie
             return context
     if network_error is not None:
         raise network_error

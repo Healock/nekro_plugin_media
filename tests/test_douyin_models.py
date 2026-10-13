@@ -114,3 +114,11 @@ def test_title_truncation() -> None:
     assert len(context.title(10)) == 12  # 10 字符 + 省略号
     assert context.title(10).endswith("……")
     assert models.DouyinContext(desc="  ").title(10) == "无标题"
+
+
+def test_download_cookie_is_runtime_only() -> None:
+    context = models.DouyinContext(desc="测试", download_cookie="ttwid=secret")
+    assert context.download_cookie == "ttwid=secret"
+    dumped = context.model_dump()
+    assert "download_cookie" not in dumped
+    assert "secret" not in repr(context)

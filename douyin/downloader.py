@@ -127,9 +127,13 @@ async def _stream_to_file(response: aiohttp.ClientResponse, temp_path: Path) -> 
     return written
 
 
-async def _download_direct(video_url: str, output_path: Path, referer: str) -> None:
+async def _download_direct(
+    video_url: str, output_path: Path, referer: str, cookie: str | None = None
+) -> None:
     """通过直链流式下载：先写 ``.part``，校验通过后原子替换为成品。"""
     headers = {**COMMON_HEADERS, "Referer": referer}
+    if cookie:
+        headers["Cookie"] = cookie
     timeout = aiohttp.ClientTimeout(total=None, connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
     with atomic_output(output_path) as temp_path:
         try:
@@ -153,7 +157,12 @@ async def _download_direct(video_url: str, output_path: Path, referer: str) -> N
 
 
 def _download_with_ytdlp(
-    aweme_id: str, out_tmpl: str, format_str: str, data_dir: Path, cancel_event: threading.Event
+    aweme_id: str,
+    out_tmpl: str,
+    format_str: str,
+    data_dir: Path,
+    cancel_event: threading.Event,
+    cookie: str | None = None,
 ) -> None:
     """yt-dlp 兜底下载（在工作线程内执行，产出写入调用方给定的唯一暂存模板）。
 
@@ -170,6 +179,11 @@ def _download_with_ytdlp(
         if cancel_event.is_set():
             raise DownloadCancelled(f"cancel requested for {aweme_id}")
 
+    headers = dict(COMMON_HEADERS)
+    cookie_path = data_dir / "douyin_cookies.txt"
+    if not cookie_path.exists() and cookie:
+        headers["Cookie"] = cookie
+
     options = {
         "format": format_str,
         "outtmpl": out_tmpl,
@@ -178,10 +192,9 @@ def _download_with_ytdlp(
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
-        "http_headers": COMMON_HEADERS,
+        "http_headers": headers,
         "progress_hooks": [_abort_if_cancelled],
     }
-    cookie_path = data_dir / "douyin_cookies.txt"
     if cookie_path.exists():
         options["cookiefile"] = str(cookie_path)
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -199,6 +212,7 @@ def _download_ytdlp_staged(
     format_str: str,
     data_dir: Path,
     cancel_event: threading.Event,
+    cookie: str | None = None,
 ) -> bool:
     """在工作线程内，经共享执行器自持 yt-dlp 暂存目录的整个生命周期。
 
@@ -210,7 +224,11 @@ def _download_ytdlp_staged(
     """
 
     def produce(work_dir: Path, event: threading.Event) -> None:
-        _download_with_ytdlp(aweme_id, str(work_dir / f"{aweme_id}.%(ext)s"), format_str, data_dir, event)
+        args = (aweme_id, str(work_dir / f"{aweme_id}.%(ext)s"), format_str, data_dir, event)
+        if cookie is None:
+            _download_with_ytdlp(*args)
+        else:
+            _download_with_ytdlp(*args, cookie)
 
     try:
         return run_staged_download(
@@ -246,6 +264,7 @@ async def _download(
     quality: str,
     data_dir: Path,
     cancel_event: threading.Event,
+    cookie: str | None = None,
 ) -> None:
     """按 无水印直链 → yt-dlp → 带水印/低码率 的顺序降级，全部失败则抛出异常。
 
@@ -256,11 +275,16 @@ async def _download(
     await asyncio.to_thread(output_path.parent.mkdir, parents=True, exist_ok=True)
     last_error: MediaDownloadError | None = None
 
+    def download_direct(url: str) -> Awaitable[None]:
+        if cookie is None:
+            return _download_direct(url, output_path, referer)
+        return _download_direct(url, output_path, referer, cookie)
+
     # 档位一：无水印直链（可重试）。取消即短路后续尝试与档位。
     if video_url and not cancel_event.is_set():
         try:
             await run_with_retry(
-                lambda: _download_direct(video_url, output_path, referer),
+                lambda: download_direct(video_url),
                 max_retries=_MAX_RETRIES,
                 backoff=_RETRY_BACKOFF,
                 on_retry=_retry_logger(aweme_id, "无水印直链"),
@@ -284,7 +308,13 @@ async def _download(
     format_str = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
     try:
         published = await asyncio.to_thread(
-            _download_ytdlp_staged, aweme_id, output_path, format_str, data_dir, cancel_event
+            _download_ytdlp_staged,
+            aweme_id,
+            output_path,
+            format_str,
+            data_dir,
+            cancel_event,
+            cookie,
         )
     except MediaDownloadError as exc:
         last_error = exc
@@ -305,7 +335,7 @@ async def _download(
     if watermark_url and watermark_url != video_url:
         try:
             await run_with_retry(
-                lambda: _download_direct(watermark_url, output_path, referer),
+                lambda: download_direct(watermark_url),
                 max_retries=_MAX_RETRIES,
                 backoff=_RETRY_BACKOFF,
                 on_retry=_retry_logger(aweme_id, "带水印兜底"),
@@ -331,6 +361,7 @@ async def _download_guarded(
     data_dir: Path,
     total_timeout: float,
     cancel_event: threading.Event,
+    cookie: str | None = None,
 ) -> None:
     """为整个下载流程施加总超时；超时或外层取消时置位协作式取消信号并清理 ``.part``。
 
@@ -339,7 +370,16 @@ async def _download_guarded(
     """
     try:
         await asyncio.wait_for(
-            _download(aweme_id, output_path, video_url, watermark_url, quality, data_dir, cancel_event),
+            _download(
+                aweme_id,
+                output_path,
+                video_url,
+                watermark_url,
+                quality,
+                data_dir,
+                cancel_event,
+                cookie,
+            ),
             timeout=total_timeout,
         )
     except TimeoutError as exc:
@@ -363,12 +403,21 @@ def schedule_download(
     *,
     watermark_url: str | None = None,
     timeout: float = _DEFAULT_TOTAL_TIMEOUT,
+    cookie: str | None = None,
 ) -> asyncio.Task[None]:
     """调度后台下载；同一 ``aweme_id`` 进行中时复用同一任务，避免重复下载。"""
 
     def factory(cancel_event: threading.Event) -> Awaitable[None]:
         return _download_guarded(
-            aweme_id, output_path, video_url, watermark_url, quality, data_dir, timeout, cancel_event
+            aweme_id,
+            output_path,
+            video_url,
+            watermark_url,
+            quality,
+            data_dir,
+            timeout,
+            cancel_event,
+            cookie,
         )
 
     return _DOWNLOADS.schedule(aweme_id, factory)

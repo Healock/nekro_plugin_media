@@ -149,8 +149,20 @@ async def process_message(
                         data_dir,
                         watermark_url=context.video_url_watermarked,
                         timeout=float(_config_int(config, "douyin_download_timeout", 180)),
+                        cookie=context.download_cookie,
                     )
                     watch_download(task, aweme_id, bot, event)
+                    try:
+                        await task
+                    except Exception:
+                        # watch_download 已负责一次用户可见的失败提示；失败时不把不存在的
+                        # 占位路径交给 Media matcher，也不改写原始消息。
+                        return
+                    cached = find_cached_file(temp_dir, aweme_id)
+                    if cached is None:
+                        core.logger.warning(f"[Douyin] 下载任务完成但未找到有效成品：{aweme_id}")
+                        return
+                    media_path = cached
                 replacement.append(MessageSegment.video(file=str(media_path.absolute())))
         else:
             replacement.append(segment)
