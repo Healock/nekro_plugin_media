@@ -1,5 +1,7 @@
 # NekroAgent 媒体阅读器
 
+版本：`1.5.1`
+
 > 处理 OneBot 音频和视频消息，并整合 Bilibili / 抖音分享链接解析、下载与媒体分析能力。
 
 媒体分析使用 NekroAgent 的模型组配置。旧版 Gemini 配置仅用于兼容原有部署。
@@ -42,6 +44,7 @@ nekro_plugin_media/
 - 抖音链路使用优先级 `9`，识别分享链接：视频帖替换为无水印视频消息，图文帖直接展开图片并注入文案、作者与互动数据。
 - 媒体分析链路使用优先级 `10`，为音频和视频建立句柄，按需调用 `analyze_media_file`。
 - 音频解析同步返回结果；视频解析进入后台任务，完成后向原聊天推送结果。
+- 成功创建媒体句柄后，通过版本化的 `debounce_bridge` capability 向已加载的 debounce 插件发布带原始消息 ID 的媒体 hint；debounce 未安装或版本不兼容时，Media 正常工作且不强行推断媒体状态。
 - 缓存、临时文件以及 Bilibili / 抖音下载任务可通过 `clear_media` 命令清理。
 - Bilibili 与抖音均已并入本插件，`bilibili/`、`douyin/` 不包含第二个 `NekroPlugin` 实例。
 
