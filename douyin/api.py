@@ -1,6 +1,6 @@
-"""抖音链接解析：短链跳转 + 分享页 `_ROUTER_DATA` 抓取。
+"""抖音分享页回退解析：短链跳转 + `_ROUTER_DATA` 抓取。
 
-主链路零签名、零登录 Cookie，不依赖任何第三方解析接口，也不依赖 Node/JS：
+该回退路径不依赖登录 Cookie、第三方解析接口或 Node/JS：
 
 1. 短链（v.douyin.com / jx.douyin.com）经由一次 302 跳转拿到 aweme_id；
 2. 请求 `www.iesdouyin.com/share/{video|note|slides}/{aweme_id}/` 分享页，
