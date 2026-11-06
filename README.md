@@ -1,6 +1,6 @@
 # NekroAgent 媒体阅读器
 
-版本：`1.5.1`
+版本：`1.6.0`
 
 > 处理 OneBot 音频和视频消息，并整合 Bilibili / 抖音分享链接解析、下载与媒体分析能力。
 
@@ -50,15 +50,15 @@ nekro_plugin_media/
 
 ## 抖音解析说明
 
-- 主链路零签名、零登录 Cookie，不依赖第三方解析接口，也不依赖 Node/JS 签名：
-  短链经一次 302 跳转得到 `aweme_id`，再请求 `iesdouyin.com` 分享页，从内联的 `_ROUTER_DATA`
-  提取作品信息，并将播放地址中的 `playwm` 替换为 `play` 得到无水印直链。
-- 实测分享页在完全无 Cookie 时会返回空壳页面；此时插件会向 `ttwid.bytedance.com` 匿名注册一枚设备
-  Cookie `ttwid` 后重试（仍不含登录态与签名）。
-- 分享页解析成功后，本次请求使用的匿名 `ttwid` 会仅在内存中传递给视频直链与 `yt-dlp` 下载，
-  不写入日志、聊天历史或上下文序列化。若数据目录存在 `douyin_cookies.txt`，`yt-dlp` 优先使用该文件。
+- 内置解析优先使用游客签名详情接口：访问 `live.douyin.com` 获取匿名 `ttwid` 与 `UIFID_TEMP`，
+  生成 `a_bogus` 和 WebSign 后请求作品详情。无需登录 Cookie，不调用第三方解析 API。
+- 签名详情接口失败时回退到分享页 `_ROUTER_DATA` 解析；分享页需要匿名 `ttwid`，插件会自动注册并刷新。
+- 游客 Cookie 仅在内存中传给本次媒体下载，不进入日志、聊天历史或上下文序列化。若数据目录存在
+  `douyin_cookies.txt`，`yt-dlp` 兜底下载优先使用该登录 Cookie 文件。
+- ABogus 所需的 `gmssl` 仅在首次生成签名时通过 Nekro 动态依赖机制加载，不在插件 import 阶段安装依赖。
+  抖音接口和签名会变化；上游项目也提示解析可能不可用，当前实现仍需在实际服务器验证。
 - 可选 DTK API 后端：将 `douyin_api_provider` 设为 `dtk` 并填写 `douyin_api_base_url`。配置 API Key 时使用
-  `X-API-Key`；测试服务若支持公开 Demo 登录，可开启 `douyin_api_demo_login`。DTK 请求失败会回退内置分享页解析。
+  `X-API-Key`；测试服务若支持公开 Demo 登录，可开启 `douyin_api_demo_login`。DTK 请求失败会回退内置游客签名解析，再回退分享页。
   公共 demo 仅适合测试，不建议作为生产服务。DTK 返回的媒体 URL 按不可信输入处理：仅接受 HTTP(S)，并拒绝
   localhost、私有/保留 IP 及解析到非公网地址的主机。DTK 不提供带水印直链时，下载链为无水印直链后回退 yt-dlp。
 - 可选 `ucmao/media-parser` 后端：将 `douyin_api_provider` 设为 `media_parser`，并把
@@ -110,7 +110,7 @@ Bilibili 与抖音下载链路（以及共用的 `download_kit.py`）遵循以�
 | `douyin_max_duration` | `30` | 抖音视频最大时长，单位为分钟 |
 | `douyin_desc_char_limit` | `150` | 抖音文案截断长度 |
 | `douyin_download_timeout` | `180` | 抖音下载总超时，单位为秒 |
-| `douyin_api_provider` | `native` | 抖音解析后端：`native`、`dtk` 或 `media_parser` |
+| `douyin_api_provider` | `native` | 抖音解析后端：`native`（游客签名，失败后分享页回退）、`dtk` 或 `media_parser` |
 | `douyin_api_base_url` | 空 | API 根地址；`media_parser` 例如 `http://media-parser:8051` |
 | `douyin_api_key` | 空 | API 服务的可选 `X-API-Key` |
 | `douyin_api_demo_login` | `false` | 是否使用 DTK 服务的 `/api/v1/auth/demo` 测试登录 |
@@ -134,6 +134,7 @@ douyin_api_key = 留空（仅当自建服务启用了鉴权时填写）
 - 使用非 Gemini 原生模型组时，服务商必须支持 OpenAI 兼容的音频或视频多模态输入；具体能力由服务商决定。
 - `ffmpeg`，用于部分音视频转换。
 - `yt-dlp`，用于 Bilibili 视频下载，以及抖音直链失败时的兜底下载；部署时需要确保插件运行环境可以安装或提供该依赖。
+- `gmssl`，在抖音游客签名路径首次使用时由 Nekro 动态依赖机制加载。
 - 可选的 `bilibili_cookies.txt`，放在插件数据目录中，用于需要登录态的下载场景。
 - 可选的 `douyin_cookies.txt`，放在插件数据目录中，用于抖音 yt-dlp 兜底下载需要登录态的场景。
 
@@ -173,7 +174,7 @@ python -m pytest <目录名>/tests
 
 完整行为需要真实的 NekroAgent、OneBot V11、模型服务商、ffmpeg、yt-dlp 和 NapCat 环境验证。模型组配置变更后，应确认服务商支持当前媒体类型；媒体分析链路本身未在本地完成真实音视频请求验证。
 
-抖音主链路（短链解析、分享页 `_ROUTER_DATA`、`playwm → play` 去水印、直链下载）已在真实网络下验证；`yt-dlp` 兜底与 OneBot 端到端投递仍需完整运行环境确认。
+原分享页回退链路（短链解析、`_ROUTER_DATA`、`playwm → play` 和直链下载）曾在真实网络下验证；本次新增的游客签名接口尚未做真实抖音请求验证。`yt-dlp` 兜底与 OneBot 端到端投递也仍需完整运行环境确认。
 
 ## 相关资源
 
@@ -183,4 +184,7 @@ python -m pytest <目录名>/tests
 
 ## 许可证
 
-本项目当前未单独声明许可证。
+本项目采用 AGPL-3.0，详见仓库根目录的 `LICENSE`。抖音游客签名解析改编自
+[ImNotBird/astrbot_plugin_video_resolver](https://github.com/ImNotBird/astrbot_plugin_video_resolver)，
+其项目采用 AGPL-3.0。ABogus 实现改编自 [Johnserf-Seed/f2](https://github.com/Johnserf-Seed/f2)，
+该文件按 Apache-2.0 授权，见 `douyin/ABOGUS_LICENSE`。
